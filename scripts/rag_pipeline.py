@@ -1,11 +1,18 @@
 """
 RAG 全链路
 ==================
-意图分类 → 知识检索 → Prompt 拼接 → LLM 生成 → 多轮对话
+意图分类 → 越界改写 → 知识检索 → Prompt 拼接 → LLM 生成 → 多轮对话
+
+越界方案（4层防护）：
+  Layer 1: 意图分类器拦截 — reject_time 高置信度直接拒绝
+  Layer 2: 查询改写拆解 — 中置信度时，将现代概念映射为时间安全子查询
+  Layer 3: 多轮检索合并 — 多个子查询分别检索，合并去重
+  Layer 4: System Prompt 时间边界 — 鲁迅只知道1936年前的事
 
 架构：
   用户输入 → intent_classifier (5分类)
-           → 按意图选择检索域
+           → [time_aware + 中置信度] → query_rewriter (概念映射+改写拆解)
+           → 按意图选择检索域 + 多子查询检索合并
            → ChromaDB 语义检索
            → 拼接 System Prompt + Context + User Query
            → LLM 生成
@@ -16,9 +23,10 @@ RAG 全链路
   python scripts/rag_pipeline.py --once "鲁迅的原名是什么？"  # 单次问答
 
 依赖：
-  - scripts/query.py         (ChromaDB + BGE 检索)
-  - scripts/llm_client.py    (LLM API 统一调用)
-  - scripts/intent_classifier.py (意图分类)
+  - scripts/query.py              (ChromaDB + BGE 检索)
+  - scripts/llm_client.py         (LLM API 统一调用)
+  - scripts/intent_classifier.py  (意图分类)
+  - scripts/query_rewriter.py     (越界查询改写)
   - prompts/luxun_digital_human_v2.md  (数字人 Prompt)
   - prompts/venue_narrator_v1.md       (讲解员 Prompt)
 """
@@ -43,6 +51,7 @@ import torch
 
 from intent_classifier import classify
 from llm_client import LLMClient
+from query_rewriter import QueryRewriter, RewriteResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag_pipeline")
@@ -259,9 +268,10 @@ class RAGPipeline:
         self.retriever = Retriever()
         self.prompts = PromptManager()
         self.llm = LLMClient()
+        self.rewriter = QueryRewriter(llm_client=self.llm)
         self.state = ConversationState()
 
-        logger.info("RAG 全链路就绪。")
+        logger.info("RAG 全链路就绪（含越界改写层）。")
 
     # ---- 检索策略 ----
 
@@ -279,15 +289,131 @@ class RAGPipeline:
             return self.retriever.search(expanded_query, domain_filter=domains)
         return []
 
+    def _retrieve_multi(
+        self, sub_queries: List[str], intent: str, top_k_per_query: int = 3
+    ) -> list[dict]:
+        """
+        多子查询检索 + 合并去重。
+        用于越界改写后的多轮检索（Layer 3）。
+
+        Args:
+            sub_queries:      改写后的多个子查询
+            intent:           意图（决定检索域）
+            top_k_per_query:  每个子查询的返回条数
+
+        Returns:
+            合并去重后的检索结果列表（按 distance 排序）
+        """
+        seen_ids = set()
+        merged = []
+
+        for sq in sub_queries:
+            chunks = self._retrieve(sq, intent)
+            for c in chunks:
+                cid = c.get("chunk_id", "")
+                if cid and cid not in seen_ids:
+                    seen_ids.add(cid)
+                    merged.append(c)
+                elif not cid:
+                    # 无 chunk_id 的兜底去重：用 content 前 60 字符
+                    key = c.get("content", "")[:60]
+                    if key not in seen_ids:
+                        seen_ids.add(key)
+                        merged.append(c)
+
+        # 按 distance 升序（越相似越靠前）
+        merged.sort(key=lambda x: x.get("distance", 999.0))
+
+        logger.info(
+            "多子查询检索: %d 子查询 → %d 条去重结果 (top_k=%d)",
+            len(sub_queries), len(merged), top_k_per_query,
+        )
+
+        return merged[:TOP_K * 2]  # 最多返回 2 倍 Top-K
+
+    # ---- 越界改写入口 (Layer 2) ----
+
+    def _try_rewrite(
+        self, user_input: str, intent_result: dict, verbose: bool = False
+    ) -> Optional[RewriteResult]:
+        """
+        尝试对时间越界问题进行改写。
+
+        触发条件（任一满足即触发）：
+          (a) reject_time → 始终先尝试改写（挽留优先，改写失败才拒绝）
+          (b) time_aware + time_warning（低置信越界已降级）
+          (c) 改写器自身检测到现代概念（补充 Layer 1 未覆盖的概念）
+
+        Returns:
+            RewriteResult 如果改写成功，None 如果不需要改写
+        """
+        intent = intent_result["intent"]
+        confidence = intent_result.get("confidence", 0)
+
+        # 判断是否需要改写
+        need_rewrite = False
+
+        if intent == "reject_time":
+            need_rewrite = True  # 所有越界都先尝试改写挽留
+        elif intent_result.get("time_aware") and intent_result.get("time_warning"):
+            need_rewrite = True
+
+        # 补充：即使 Layer 1 未检测到，也让改写器扫描一次
+        # 因为 Layer 1 的词表有限，改写器有更完善的概念映射表
+        if not need_rewrite:
+            # 轻量扫描（不调用 LLM）
+            probe = self.rewriter.rewrite(
+                user_input, intent_result=intent_result, use_llm=False
+            )
+            if probe.modern_concepts:
+                need_rewrite = True
+                if verbose:
+                    logger.info(
+                        "Layer 2: 改写器检测到 Layer 1 未覆盖的现代概念: %s",
+                        probe.modern_concepts,
+                    )
+
+        if not need_rewrite:
+            return None
+
+        if verbose:
+            logger.info(
+                "Layer 2: 尝试查询改写 (intent=%s, conf=%.2f, time_aware=%s)",
+                intent, confidence, intent_result.get("time_aware"),
+            )
+
+        # 调用改写器（启用 LLM 辅助复杂改写）
+        rewrite_result = self.rewriter.rewrite(
+            user_input,
+            intent_result=intent_result,
+            use_llm=True,
+        )
+
+        if verbose:
+            logger.info(
+                "改写结果: can_rewrite=%s, %d 子查询, concepts=%s",
+                rewrite_result.can_rewrite,
+                len(rewrite_result.sub_queries),
+                rewrite_result.modern_concepts,
+            )
+
+        return rewrite_result
+
     # ---- 单轮问答 ----
 
     def ask(self, user_input: str, verbose: bool = False) -> str:
         """
         处理一轮对话。
 
+        越界方案（4层）：
+          Layer 1: intent_classifier 拦截高置信越界
+          Layer 2: query_rewriter 改写中置信越界
+          Layer 3: 多子查询检索合并
+          Layer 4: System Prompt 时间边界
+
         Args:
             user_input: 用户原始输入
-            verbose:    是否打印调试信息（意图、检索结果）
+            verbose:    是否打印调试信息
 
         Returns:
             LLM 生成的回复文本
@@ -296,7 +422,7 @@ class RAGPipeline:
         if not user_input:
             return "（请输入你的问题）"
 
-        # ── Step 1: 意图分类 ──
+        # ── Step 1: 意图分类 (Layer 1) ──
         intent_result = classify(user_input)
         intent = intent_result["intent"]
         self.state.current_intent = intent
@@ -315,15 +441,42 @@ class RAGPipeline:
             self.state.add(user_input, reply)
             return reply
 
-        # 2b. 时间越界 → 鲁迅口吻拒绝（不检索）
-        if intent == "reject_time":
-            reply = self._handle_reject_time(user_input, intent_result)
+        # 2b. 越界改写尝试 (Layer 2) — 所有 reject_time / time_aware 都先尝试改写
+        #     如果改写成功，检索改写后的子查询并生成回复
+        #     如果改写失败，用鲁迅口吻拒绝
+        rewrite_result = self._try_rewrite(user_input, intent_result, verbose=verbose)
+
+        rewrite_notice = ""  # 用于告知 LLM 经过了改写
+        if rewrite_result and rewrite_result.can_rewrite and rewrite_result.sub_queries:
+            # ── Layer 3: 多子查询检索合并 ──
+            # 用改写后的子查询检索，意图统一按"当前意图或 ambiguous"处理
+            search_intent = intent if intent not in ("reject_time",) else "ambiguous"
+            chunks = self._retrieve_multi(
+                rewrite_result.sub_queries, search_intent
+            )
+
+            # 构建改写说明
+            if rewrite_result.modern_concepts:
+                concepts_str = "、".join(rewrite_result.modern_concepts[:3])
+                subs_str = "；".join(rewrite_result.sub_queries[:3])
+                rewrite_notice = (
+                    "\n\n[系统提醒：用户问题涉及「" + concepts_str + "」等概念，"
+                    "这些在1936年后才出现。已将问题改写为：「" + subs_str + "」。"
+                    "请基于参考资料回答这些改写后的问题，并在回答开头用鲁迅口吻简要说明"
+                    "你只了解1936年前的事物。]"
+                )
+        elif rewrite_result and not rewrite_result.can_rewrite:
+            # 改写失败 → 用越界话术回复
+            reply = rewrite_result.fallback_message or (
+                "这大约是什么新奇的东西罢。"
+                "我生于光绪七年，殁于民国二十五年，怕是未曾见过。"
+                "大抵是我所不能知道的事了。"
+            )
             self.state.add(user_input, reply)
             return reply
-
-        # 2c. 正常/模糊 → 检索 + 生成
-        # 检索
-        chunks = self._retrieve(user_input, intent)
+        else:
+            # 正常/模糊 → 直接检索
+            chunks = self._retrieve(user_input, intent)
 
         if verbose:
             logger.info("检索到 %d 条 (intent=%s)", len(chunks), intent)
@@ -331,19 +484,25 @@ class RAGPipeline:
                 logger.info("  [%d] type:%s | %s | dist:%.2f",
                             i + 1, c["type"], c["title"][:40], c["distance"])
 
-        # 选择 System Prompt
+        # ── Layer 4: System Prompt 时间边界 ──
         if intent == "narrator":
             system_prompt = self.prompts.narrator
         else:
             system_prompt = self.prompts.luxun
 
-        # 低置信度越界 → 加时间提醒标记
+        # 时间边界提示
+        time_boundary_note = ""
         if intent_result.get("time_aware") and intent_result.get("time_warning"):
-            time_note = (
+            time_boundary_note = (
                 f"\n\n[系统提醒：用户问题涉及 {intent_result['time_warning']}，"
                 f"这些概念在1936年后才出现。请按时间边界规则处理，不要编造。]"
             )
-            system_prompt = system_prompt + time_note
+
+        # 合并改写说明和时间边界
+        if rewrite_notice:
+            system_prompt = system_prompt + rewrite_notice
+        elif time_boundary_note:
+            system_prompt = system_prompt + time_boundary_note
 
         # 格式化上下文
         context_str = format_context(chunks)
@@ -353,7 +512,6 @@ class RAGPipeline:
             if len(self.state.history) >= 2:
                 # 多轮对话模式
                 messages = self.state.to_messages(system_prompt)
-                # 追加当前用户消息（含 context）
                 user_content = (
                     f"【参考资料】\n{context_str}\n\n"
                     f"【用户问题】\n{user_input}"
