@@ -32,6 +32,10 @@ data/raw/
 data/processed/
 *.db
 *.sqlite
+*.sqlite3
+
+# ChromaDB 向量库（本地生成，不入库）
+chroma_db/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -41,3 +45,5 @@ models/
 *.bin
 *.pt
 *.onnx
+*.safetensors
+scripts/bge-small-zh-v1.5/
