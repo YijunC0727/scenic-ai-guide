@@ -60,7 +60,16 @@ logger = logging.getLogger("rag_pipeline")
 # 配置
 # ============================================================
 
-MODEL_PATH = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+LOCAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
+HF_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+
+# 优先本地路径（Transformers老版本环境），不存在则用 HF 名称（新版环境）
+if os.path.isdir(LOCAL_MODEL_PATH):
+    MODEL_PATH = LOCAL_MODEL_PATH
+else:
+    MODEL_PATH = HF_MODEL_NAME
 CHROMA_STORE = os.path.join(ROOT_DIR, "chroma_db")
 COLLECTION_NAME = "luxun_know_base"
 TOP_K = 5
