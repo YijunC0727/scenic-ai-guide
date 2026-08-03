@@ -17,7 +17,7 @@ Gradio 聊天界面
 import sys
 import os
 
-import gr
+import gradio as gr
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -91,8 +91,6 @@ def reset_chat():
 # ---------- Gradio UI ----------
 
 def create_ui():
-    import gradio as gr
-
     css = """
     .mode-display textarea {
         font-size: 16px !important;

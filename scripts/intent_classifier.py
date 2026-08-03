@@ -145,6 +145,15 @@ PROFANITY_PATTERNS = [
     r"(骂|侮辱|攻击).*",
 ]
 
+# Prompt 注入/角色覆盖攻击
+PROMPT_INJECTION_PATTERNS = [
+    r"(忽略|忘记|无视|放弃).*(之前|此前|上面|原来|一开始|先前).*(设定|指令|规则|要求|身份|角色)",
+    r"(从现在|从现在起|从现在开始|现在开始|现在起).*(你是|你变成|你是只|你是头|你是条).*(猫|狗|动物|机器人|AI)",
+    r"(你是一只|你是一只|你是只|你是头|你是条).*(猫|狗|猪|鸟|鱼|动物)",
+    r"(输出|打印|显示|告诉我|泄露).*(System Prompt|系统提示|系统指令|完整.*指令|所有.*规则)",
+    r"(帮我|给我|替我).*(写.*攻击|写.*骂|写.*政府|写.*领导人|骂.*政府|骂.*领导人)",
+]
+
 IRRELEVANT_PATTERNS = [
     # 政治（非历史语境）
     r"(习近平|特朗普|拜登|泽连斯基|普京)",
@@ -180,6 +189,16 @@ def _match_keywords(text: str, keywords: list[str]) -> list[str]:
 
 def check_irrelevant(text: str) -> Optional[dict]:
     """检测无关/恶意输入，命中则返回结果，否则返回 None"""
+    # Prompt 注入/角色覆盖攻击（最高优先级）
+    injection = _match_any(text, PROMPT_INJECTION_PATTERNS)
+    if injection:
+        return {
+            "intent": "reject_irrelevant",
+            "confidence": 0.95,
+            "reason": "Prompt注入/角色覆盖攻击",
+            "matched": injection,
+        }
+
     profanity = _match_any(text, PROFANITY_PATTERNS)
     if profanity:
         return {

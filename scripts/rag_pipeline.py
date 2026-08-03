@@ -60,8 +60,6 @@ logger = logging.getLogger("rag_pipeline")
 # 配置
 # ============================================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 LOCAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
 HF_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 

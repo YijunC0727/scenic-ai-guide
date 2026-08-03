@@ -4,8 +4,8 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 
 # 配置
-current_dir = os.getcwd()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
 LOCAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
 HF_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
@@ -15,7 +15,6 @@ if os.path.isdir(LOCAL_MODEL_PATH):
     MODEL_PATH = LOCAL_MODEL_PATH
 else:
     MODEL_PATH = HF_MODEL_NAME
-ROOT = os.path.dirname(current_dir)
 CHROMA_STORE = os.path.join(ROOT, "chroma_db")
 
 TOP_K = 5
