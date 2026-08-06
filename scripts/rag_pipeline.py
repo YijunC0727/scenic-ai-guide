@@ -295,6 +295,7 @@ class RAGPipeline:
         self.llm = LLMClient()
         self.rewriter = QueryRewriter(llm_client=self.llm)
         self.state = ConversationState()
+        self.last_debug = {}  # 调试信息，每次 ask() 后更新
 
         logger.info("RAG 全链路就绪（含越界改写层）。")
 
@@ -451,6 +452,17 @@ class RAGPipeline:
                 return "（请输入你的问题）", []
             return "（请输入你的问题）"
 
+        t_start = time.time()
+        self.last_debug = {
+            "intent": "", "confidence": 0, "reason": "", "matched": [],
+            "time_boundary": False, "time_warning": "",
+            "rewrite_used": False, "rewrite_concepts": [], "rewrite_queries": [],
+            "rewrite_fallback": "",
+            "chunks": [], "chunk_count": 0,
+            "elapsed_ms": 0, "reply_len": 0, "error": None,
+            "guard_status": "PASS", "guard_details": [],
+        }
+
         # ── Step 1: 意图分类 (Layer 1) ──
         if force_mode is not None:
             intent = force_mode
@@ -460,6 +472,15 @@ class RAGPipeline:
             intent_result = classify(user_input)
             intent = intent_result["intent"]
             self.state.current_intent = intent
+
+        self.last_debug.update({
+            "intent": intent,
+            "confidence": intent_result.get("confidence", 0),
+            "reason": intent_result.get("reason", ""),
+            "matched": intent_result.get("matched", [])[:5],
+            "time_boundary": intent_result.get("time_aware", False),
+            "time_warning": intent_result.get("time_warning", ""),
+        })
 
         if verbose:
             logger.info("意图: %s (conf=%.2f) reason=%s",
@@ -472,6 +493,8 @@ class RAGPipeline:
         # 2a. 无关/恶意 → 直接拒绝
         if intent == "reject_irrelevant":
             reply = REJECT_IRRELEVANT_RESPONSE
+            self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
+            self.last_debug["reply_len"] = len(reply)
             self.state.add(user_input, reply)
             if return_retrieval:
                 return reply, []
@@ -485,11 +508,16 @@ class RAGPipeline:
         rewrite_notice = ""  # 用于告知 LLM 经过了改写
         if rewrite_result and rewrite_result.can_rewrite and rewrite_result.sub_queries:
             # ── Layer 3: 多子查询检索合并 ──
-            # 用改写后的子查询检索，意图统一按"当前意图或 ambiguous"处理
             search_intent = intent if intent not in ("reject_time",) else "ambiguous"
             chunks = self._retrieve_multi(
                 rewrite_result.sub_queries, search_intent
             )
+
+            self.last_debug.update({
+                "rewrite_used": True,
+                "rewrite_concepts": rewrite_result.modern_concepts[:5] if rewrite_result.modern_concepts else [],
+                "rewrite_queries": rewrite_result.sub_queries[:5],
+            })
 
             # 构建改写说明
             if rewrite_result.modern_concepts:
@@ -508,6 +536,12 @@ class RAGPipeline:
                 "我生于光绪七年，殁于民国二十五年，怕是未曾见过。"
                 "大抵是我所不能知道的事了。"
             )
+            self.last_debug.update({
+                "rewrite_used": True,
+                "rewrite_fallback": "改写失败，使用越界话术",
+            })
+            self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
+            self.last_debug["reply_len"] = len(reply)
             self.state.add(user_input, reply)
             if return_retrieval:
                 return reply, []
@@ -521,6 +555,18 @@ class RAGPipeline:
             for i, c in enumerate(chunks[:3]):
                 logger.info("  [%d] type:%s | %s | dist:%.2f",
                             i + 1, c["type"], c["title"][:40], c["distance"])
+
+        # 存储检索结果摘要供调试面板使用
+        chunk_summaries = []
+        for c in chunks[:5]:
+            chunk_summaries.append({
+                "title": (c.get("title") or "")[:60],
+                "type": c.get("type", ""),
+                "distance": round(c.get("distance", 0), 3),
+                "snippet": (c.get("content") or "")[:100],
+            })
+        self.last_debug["chunks"] = chunk_summaries
+        self.last_debug["chunk_count"] = len(chunks)
 
         # ── Layer 4: System Prompt 时间边界 ──
         if intent == "narrator":
@@ -566,9 +612,14 @@ class RAGPipeline:
         except Exception as e:
             logger.error("LLM 调用失败: %s", e)
             reply = f"（回答生成失败：{e}）"
+            self.last_debug["error"] = str(e)
+            self.last_debug["guard_status"] = "FAIL"
 
         # ── Step 4: 保存对话历史 ──
         self.state.add(user_input, reply)
+
+        self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
+        self.last_debug["reply_len"] = len(reply)
 
         # 返回分支
         if return_retrieval:
