@@ -32,6 +32,13 @@ RAG 全链路
 """
 
 import os
+# =========【必须放在所有transformers导入之前！】=========
+# 适配transformers5.x，消除各类警告、路径识别bug
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 import sys
 import json
 import time
@@ -39,6 +46,9 @@ import logging
 import argparse
 from typing import Optional, List, Dict
 from dataclasses import dataclass, field
+
+# 屏蔽transformers冗余日志
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # 确保 scripts 目录在 path 中
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,17 +67,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("rag_pipeline")
 
 # ============================================================
-# 配置
+# 模型配置【与入库脚本完全对齐 repo_id + cache_dir】
 # ============================================================
+# 移除旧的本地MODEL_PATH模式，使用repo_id联网缓存模式，规避tokenizer/model_type bug
+REPO_ID = "BAAI/bge-small-zh-v1.5"
+CACHE_FOLDER = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
 
-LOCAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
-HF_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info("加载 BGE 模型 repo_id=%s cache=%s", REPO_ID, CACHE_FOLDER)
+tokenizer = AutoTokenizer.from_pretrained(REPO_ID, cache_dir=CACHE_FOLDER)
+model = AutoModel.from_pretrained(REPO_ID, cache_dir=CACHE_FOLDER).to(device)
+model.eval()
 
-# 优先本地路径（Transformers老版本环境），不存在则用 HF 名称（新版环境）
-if os.path.isdir(LOCAL_MODEL_PATH):
-    MODEL_PATH = LOCAL_MODEL_PATH
-else:
-    MODEL_PATH = HF_MODEL_NAME
+def get_embedding(text: str) -> list:
+    """
+    查询向量化，和入库脚本get_embedding逻辑100%对齐
+    BGE官方：取CLS输出 + L2归一化
+    """
+    inputs = tokenizer(
+        text,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt"
+    ).to(device)
+    with torch.no_grad():
+        out = model(**inputs)
+    vec = out.last_hidden_state[:, 0]
+    vec = torch.nn.functional.normalize(vec, p=2, dim=1).squeeze()
+    return vec.cpu().numpy().tolist()
+
+# ============================================================
+# 业务配置
+# ============================================================
 CHROMA_STORE = os.path.join(ROOT_DIR, "chroma_db")
 COLLECTION_NAME = "luxun_know_base"
 TOP_K = 5
@@ -99,30 +131,16 @@ REJECT_IRRELEVANT_RESPONSE = (
 
 
 # ============================================================
-# 检索器
+# 检索器【不再内部重复加载模型，复用全局tokenizer/model/get_embedding】
 # ============================================================
 
 class Retriever:
     """封装 BGE 模型 + ChromaDB 检索 + 领域过滤"""
 
     def __init__(self):
-        logger.info("加载 BGE 模型: %s", MODEL_PATH)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-        self.model = AutoModel.from_pretrained(MODEL_PATH).to(self.device)
-        self.model.eval()
-
+        logger.info("ChromaDB 已连接, collection=%s", COLLECTION_NAME)
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_STORE)
         self.collection = self.chroma_client.get_collection(COLLECTION_NAME)
-        logger.info("ChromaDB 已连接, collection=%s", COLLECTION_NAME)
-
-    def encode(self, text: str) -> list:
-        inputs = self.tokenizer(
-            text, padding=True, truncation=True, max_length=512, return_tensors="pt"
-        ).to(self.device)
-        with torch.no_grad():
-            out = self.model(**inputs)
-        return out.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
 
     def search(
         self, query: str, domain_filter: Optional[List[str]] = None, top_k: int = TOP_K
@@ -139,7 +157,7 @@ class Retriever:
             [{"content": str, "title": str, "type": str, "source": str,
               "year": int, "distance": float}, ...]
         """
-        vec = self.encode(query)
+        vec = get_embedding(query)
 
         # ChromaDB where 过滤
         where_clause = None
@@ -208,7 +226,7 @@ class PromptManager:
 # ============================================================
 
 def format_context(chunks: list[dict], max_chunks: int = 6) -> str:
-    
+
     if not chunks:
         return "（未检索到相关知识）"
 
@@ -336,7 +354,7 @@ class RAGPipeline:
             len(sub_queries), len(merged), top_k_per_query,
         )
 
-        return merged[:TOP_K * 2]  # 最多返回 2 倍 Top-K
+        return merged[:TOP_K * 2]  # 最多返回 2 倍 Top‑K
 
     # ---- 越界改写入口 (Layer 2) ----
 
@@ -408,7 +426,7 @@ class RAGPipeline:
 
     # ---- 单轮问答 ----
 
-    def ask(self, user_input: str, verbose: bool = False) -> str:
+    def ask(self, user_input: str, verbose: bool = False, force_mode: str = None, return_retrieval: bool = False):
         """
         处理一轮对话。
 
@@ -421,18 +439,27 @@ class RAGPipeline:
         Args:
             user_input: 用户原始输入
             verbose:    是否打印调试信息
+            force_mode: 强制模式 None/ "narrator"/"luxun"，不为None时跳过自动意图识别
+            return_retrieval: True时返回 (reply, chunks)；False只返回reply字符串
 
         Returns:
-            LLM 生成的回复文本
+            LLM 生成的回复文本；return_retrieval=True 返回元组(回复文本,检索片段列表)
         """
         user_input = user_input.strip()
         if not user_input:
+            if return_retrieval:
+                return "（请输入你的问题）", []
             return "（请输入你的问题）"
 
         # ── Step 1: 意图分类 (Layer 1) ──
-        intent_result = classify(user_input)
-        intent = intent_result["intent"]
-        self.state.current_intent = intent
+        if force_mode is not None:
+            intent = force_mode
+            intent_result = {"intent": force_mode, "confidence": 1.0, "reason": "manual_force"}
+            self.state.current_intent = intent
+        else:
+            intent_result = classify(user_input)
+            intent = intent_result["intent"]
+            self.state.current_intent = intent
 
         if verbose:
             logger.info("意图: %s (conf=%.2f) reason=%s",
@@ -446,6 +473,8 @@ class RAGPipeline:
         if intent == "reject_irrelevant":
             reply = REJECT_IRRELEVANT_RESPONSE
             self.state.add(user_input, reply)
+            if return_retrieval:
+                return reply, []
             return reply
 
         # 2b. 越界改写尝试 (Layer 2) — 所有 reject_time / time_aware 都先尝试改写
@@ -467,10 +496,10 @@ class RAGPipeline:
                 concepts_str = "、".join(rewrite_result.modern_concepts[:3])
                 subs_str = "；".join(rewrite_result.sub_queries[:3])
                 rewrite_notice = (
-                    "\n\n[系统提醒：用户问题涉及「" + concepts_str + "」等概念，"
-                    "这些在1936年后才出现。已将问题改写为：「" + subs_str + "」。"
-                    "请基于参考资料回答这些改写后的问题，并在回答开头用鲁迅口吻简要说明"
-                    "你只了解1936年前的事物。]"
+                        "\n\n[系统提醒：用户问题涉及「" + concepts_str + "」等概念，"
+                                                                       "这些在1936年后才出现。已将问题改写为：「" + subs_str + "」。"
+                                                                                                                            "请基于参考资料回答这些改写后的问题，并在回答开头用鲁迅口吻简要说明"
+                                                                                                                            "你只了解1936年前的事物。]"
                 )
         elif rewrite_result and not rewrite_result.can_rewrite:
             # 改写失败 → 用越界话术回复
@@ -480,6 +509,8 @@ class RAGPipeline:
                 "大抵是我所不能知道的事了。"
             )
             self.state.add(user_input, reply)
+            if return_retrieval:
+                return reply, []
             return reply
         else:
             # 正常/模糊 → 直接检索
@@ -539,14 +570,14 @@ class RAGPipeline:
         # ── Step 4: 保存对话历史 ──
         self.state.add(user_input, reply)
 
+        # 返回分支
+        if return_retrieval:
+            return reply, chunks
         return reply
-
     # ---- 越界处理 ----
 
     def _handle_reject_time(self, user_input: str, intent_result: dict) -> str:
         """处理时间越界：用鲁迅口吻表达困惑，不检索知识库"""
-        matched = intent_result.get("matched", [])
-
         # 根据匹配到的越界类型选择参考话术
         hint = REJECT_TIME_RESPONSE_HINTS.get("现代科技",
             "这大约是什么新奇的东西罢。我生于光绪七年，殁于民国二十五年，怕是未曾见过。大抵是我所不能知道的事了。")
@@ -554,7 +585,7 @@ class RAGPipeline:
         # 构建越界 Prompt
         system_prompt = self.prompts.luxun + (
             "\n\n特别注意：用户问题涉及1936年后的概念或事物。"
-            "请用鲁迅的口吻真诚地表达困惑，简短回应（2-3句话即可）。"
+            "请用鲁迅的口吻真诚地表达困惑，简短回应（2‑3句话即可）。"
         )
 
         try:
