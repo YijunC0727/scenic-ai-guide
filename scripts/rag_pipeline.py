@@ -3,11 +3,12 @@ RAG 全链路
 ==================
 意图分类 → 越界改写 → 知识检索 → Prompt 拼接 → LLM 生成 → 多轮对话
 
-越界方案（4层防护）：
+越界方案（5层防护）：
   Layer 1: 意图分类器拦截 — reject_time 高置信度直接拒绝
   Layer 2: 查询改写拆解 — 中置信度时，将现代概念映射为时间安全子查询
   Layer 3: 多轮检索合并 — 多个子查询分别检索，合并去重
   Layer 4: System Prompt 时间边界 — 鲁迅只知道1936年前的事
+  Layer 5: QualityGuard 回答后卫 — 幻觉检测 + 一致性校验 + 重试/兜底
 
 架构：
   用户输入 → intent_classifier (5分类)
@@ -62,6 +63,7 @@ import torch
 from intent_classifier import classify
 from llm_client import LLMClient
 from query_rewriter import QueryRewriter, RewriteResult
+from quality_guard import QualityGuard, GuardResult, get_fallback
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag_pipeline")
@@ -294,6 +296,7 @@ class RAGPipeline:
         self.prompts = PromptManager()
         self.llm = LLMClient()
         self.rewriter = QueryRewriter(llm_client=self.llm)
+        self.guard = QualityGuard()
         self.state = ConversationState()
         self.last_debug = {}  # 调试信息，每次 ask() 后更新
 
@@ -460,7 +463,7 @@ class RAGPipeline:
             "rewrite_fallback": "",
             "chunks": [], "chunk_count": 0,
             "elapsed_ms": 0, "reply_len": 0, "error": None,
-            "guard_status": "PASS", "guard_details": [],
+            "guard_status": "", "guard_details": {},
         }
 
         # ── Step 1: 意图分类 (Layer 1) ──
@@ -592,28 +595,87 @@ class RAGPipeline:
         context_str = format_context(chunks)
 
         # ── Step 3: 调用 LLM ──
-        try:
+        def _call_llm(temp_modifier: float = 0.0):
+            """内部函数：用指定参数调用 LLM"""
+            temp = max(0.05, 0.3 + temp_modifier)
             if len(self.state.history) >= 2:
-                # 多轮对话模式
                 messages = self.state.to_messages(system_prompt)
                 user_content = (
                     f"【参考资料】\n{context_str}\n\n"
                     f"【用户问题】\n{user_input}"
                 ) if context_str else user_input
                 messages.append({"role": "user", "content": user_content})
-                reply = self.llm.call(messages)
+                return self.llm.call(messages, temperature=temp)
             else:
-                # 首轮：用 chat 方法
-                reply = self.llm.chat(
+                return self.llm.chat(
                     system_prompt=system_prompt,
                     context=context_str,
                     user_query=user_input,
+                    temperature=temp,
                 )
+
+        reply = None
+        guard_error = None
+        try:
+            reply = _call_llm()
         except Exception as e:
             logger.error("LLM 调用失败: %s", e)
-            reply = f"（回答生成失败：{e}）"
-            self.last_debug["error"] = str(e)
+            guard_error = str(e)
+            reply = get_fallback(intent, "api_error")
+            self.last_debug["error"] = guard_error
             self.last_debug["guard_status"] = "FAIL"
+
+        # ── Step 3.5: QualityGuard 回答后校验 (Layer 5) ──
+        if not guard_error and reply:
+            guard_report = self.guard.evaluate(
+                response=reply,
+                context=chunks,
+                intent=intent,
+                query=user_input,
+            )
+
+            self.last_debug["guard_status"] = guard_report.result.value
+            self.last_debug["guard_details"] = guard_report.details
+
+            if guard_report.result == GuardResult.RETRY:
+                # 重试一次（降低 temperature 以获得更保守的回答）
+                logger.warning(
+                    "QualityGuard RETRY: %s — 正在重试 (temperature↓)",
+                    guard_report.retry_reason,
+                )
+                self.last_debug["guard_details"]["retry_reason"] = guard_report.retry_reason
+
+                try:
+                    retry_reply = _call_llm(temp_modifier=-0.15)
+                    retry_report = self.guard.evaluate(
+                        response=retry_reply,
+                        context=chunks,
+                        intent=intent,
+                        query=user_input,
+                    )
+
+                    if retry_report.result == GuardResult.RETRY:
+                        # 二次不合格 → 兜底话术
+                        logger.warning("QualityGuard 重试仍不合格 → 兜底话术")
+                        reply = get_fallback(intent, "guard_fail")
+                        self.last_debug["guard_status"] = "FALLBACK"
+                        self.last_debug["guard_details"]["final_action"] = "fallback"
+                    elif retry_report.result == GuardResult.AMEND:
+                        reply = self.guard.amend(retry_reply, retry_report.amend_text)
+                        self.last_debug["guard_status"] = "AMEND"
+                        self.last_debug["guard_details"]["final_action"] = "amend_after_retry"
+                    else:
+                        reply = retry_reply
+                        self.last_debug["guard_status"] = "PASS"
+                        self.last_debug["guard_details"]["final_action"] = "pass_after_retry"
+                except Exception as e:
+                    logger.error("QualityGuard 重试失败: %s", e)
+                    reply = get_fallback(intent, "api_error")
+                    self.last_debug["guard_status"] = "FALLBACK"
+
+            elif guard_report.result == GuardResult.AMEND:
+                reply = self.guard.amend(reply, guard_report.amend_text)
+                logger.info("QualityGuard AMEND: 已追加边界声明")
 
         # ── Step 4: 保存对话历史 ──
         self.state.add(user_input, reply)
