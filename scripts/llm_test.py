@@ -1,83 +1,96 @@
-# scripts/llm_test.py
+"""
+LLM API 快速测试脚本（薄封装 LLMClient）
+=======================================
+用法:
+  python scripts/llm_test.py                              # 默认测试
+  python scripts/llm_test.py --question "鲁迅的原名是什么？"  # 自定义问题
+  python scripts/llm_test.py --multi-turn                  # 多轮对话测试
+  python scripts/llm_test.py --stress 10                   # 压力测试（N次调用）
+"""
+
 import os
-import json
+import sys
+import time
 import argparse
-import requests
-# 在文件开头添加
-from dotenv import load_dotenv
-load_dotenv()
 
-def call_llm(provider: str, api_key: str, base_url: str, model: str, system: str, user: str):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
-    # 统一OpenAI风格 messages（大多数国产API都支持类似结构）
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 256,
-        "stream": False
-    }
-
-    resp = requests.post(base_url, headers=headers, data=json.dumps(payload), timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-
-    # 尽量兼容常见返回结构
-    # 常见：data["choices"][0]["message"]["content"]
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        # 兜底：把原始data打印出来定位字段
-        raise RuntimeError(f"Unrecognized response format: {data}")
+from llm_client import LLMClient
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", type=str, default="deepseek", choices=["deepseek", "glm"])
-    parser.add_argument("--model", type=str, default=os.getenv("LLM_MODEL", ""))
-    parser.add_argument("--api_key", type=str, default=os.getenv("LLM_API_KEY", ""))
-    parser.add_argument("--base_url", type=str, default=os.getenv("LLM_BASE_URL", ""))
-
-    parser.add_argument("--question", type=str, default="鲁迅是谁？用一句话回答。")
+    parser = argparse.ArgumentParser(description="LLM API 快速测试")
+    parser.add_argument("--question", "-q", type=str, default="鲁迅是谁？用一句话回答。",
+                        help="测试问题")
+    parser.add_argument("--model", type=str, default=None, help="模型名（覆盖 .env）")
+    parser.add_argument("--multi-turn", action="store_true", help="多轮对话测试")
+    parser.add_argument("--stress", type=int, default=0, help="压力测试（连续N次调用）")
+    parser.add_argument("--verbose", "-v", action="store_true", help="显示详细信息")
     args = parser.parse_args()
 
-    if not args.api_key:
-        raise SystemExit("Missing API key: set env LLM_API_KEY or pass --api_key")
-    if not args.base_url:
-        raise SystemExit("Missing base_url: set env LLM_BASE_URL or pass --base_url")
-    if not args.model:
-        raise SystemExit("Missing model: set env LLM_MODEL or pass --model")
-
-    system = "你是一个可靠的问答助手。请直接回答，不要输出多余解释。"
-
-    print(f"[llm_test] provider={args.provider}")
-    print(f"[llm_test] model={args.model}")
-    print(f"[llm_test] base_url={args.base_url}")
-
     try:
-        out = call_llm(
-            provider=args.provider,
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            system=system,
-            user=args.question
-        )
-        print("\n=== LLM OUTPUT ===")
-        print(out)
-    except requests.exceptions.RequestException as e:
-        print(f"\n[llm_test] HTTP/Network error: {e}")
-        raise
+        client = LLMClient(model=args.model)
+    except ValueError as e:
+        print(f"❌ 初始化失败: {e}")
+        print("请检查 .env 文件中的 LLM_API_KEY, LLM_BASE_URL, LLM_MODEL 配置")
+        return
+
+    print(f"LLM 客户端就绪 | model={client.model} | endpoint={client._endpoint}")
+
+    # 单次测试
+    system = "你是一个可靠的问答助手。请直接回答，不要输出多余解释。"
+    context = ""
+    try:
+        reply = client.chat(system, context, args.question)
+        print(f"\nQ: {args.question}")
+        print(f"A: {reply}")
+        if args.verbose:
+            print(f"\nToken 用量: {client.token_usage}")
     except Exception as e:
-        print(f"\n[llm_test] Other error: {e}")
-        raise
+        print(f"❌ 单次测试失败: {e}")
+        return
+
+    # 多轮对话测试
+    if args.multi_turn:
+        print("\n--- 多轮对话测试 ---")
+        questions = [
+            "鲁迅是谁？",
+            "他为什么弃医从文？",
+            "他最喜欢的作品是什么？",
+        ]
+        for i, q in enumerate(questions, 1):
+            try:
+                reply = client.chat_with_history(
+                    system_prompt="你是一位鲁迅研究专家，请使用鲁迅的口吻回答问题。",
+                    context="",
+                    user_query=q,
+                )
+                print(f"[{i}] Q: {q}")
+                print(f"[{i}] A: {reply[:100]}...")
+            except Exception as e:
+                print(f"[{i}] ❌ 失败: {e}")
+                break
+
+    # 压力测试
+    if args.stress > 0:
+        print(f"\n--- 压力测试 ({args.stress} 次) ---")
+        success = 0
+        times = []
+        for i in range(args.stress):
+            t0 = time.time()
+            try:
+                client.chat(system, context, f"测试 #{i+1}: {args.question}")
+                success += 1
+                times.append(time.time() - t0)
+                print(f"  #{i+1}: OK ({times[-1]:.1f}s)")
+            except Exception as e:
+                print(f"  #{i+1}: FAIL ({e})")
+        avg_time = sum(times) / len(times) if times else 0
+        print(f"\n结果: {success}/{args.stress} 成功, 平均耗时 {avg_time:.1f}s")
+        if args.verbose:
+            print(f"Token 用量: {client.token_usage}")
+            print(f"熔断器状态: {client.circuit_status}")
 
 
 if __name__ == "__main__":

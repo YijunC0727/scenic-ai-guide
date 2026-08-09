@@ -53,7 +53,7 @@ DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0     # 秒，指数退避基数
 DEFAULT_MIN_INTERVAL = 0.3          # 秒，两次调用最小间隔（简单限流）
-DEFAULT_TIMEOUT = 60                # 秒
+DEFAULT_TIMEOUT = 30                # 秒
 
 # 常用 provider → base_url 映射
 PROVIDER_URLS = {
@@ -110,6 +110,16 @@ class LLMClient:
         # 对话历史（多轮对话管理）
         self._history: List[Dict[str, str]] = []
 
+        # Token 用量统计
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+
+        # 熔断器：连续失败计数 + 冷却期
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+        self._circuit_failure_threshold = 5    # 连续5次失败触发熔断
+        self._circuit_cooldown_sec = 60.0      # 冷却60秒
+
         # --- 校验 ---
         if not self.api_key:
             raise ValueError(
@@ -144,7 +154,7 @@ class LLMClient:
     ) -> str:
         """
         底层调用：发送 messages，返回模型回复文本。
-        自动处理重试和限流。
+        自动处理重试、限流、熔断。
 
         参数：
           messages:    [{"role":"system","content":...}, ...]
@@ -153,7 +163,18 @@ class LLMClient:
 
         返回：
           模型回复字符串
+
+        Raises:
+          RuntimeError: 熔断器打开 或 重试耗尽
         """
+        # 熔断检查
+        if self._is_circuit_open():
+            cooldown_remaining = int(self._circuit_open_until - time.time())
+            raise RuntimeError(
+                f"熔断器已打开（连续 {self._circuit_failure_threshold} 次失败），"
+                f"请等待 {cooldown_remaining}s 后重试"
+            )
+
         temp = temperature if temperature is not None else self.temperature
         mt = max_tokens if max_tokens is not None else self.max_tokens
 
@@ -180,12 +201,70 @@ class LLMClient:
                 resp.raise_for_status()
                 data = resp.json()
 
-                # 兼容常见返回结构
-                content = data["choices"][0]["message"]["content"]
+                # 防御式解析：安全读取嵌套字段
+                choices = data.get("choices") or []
+                if not choices:
+                    raise ValueError(f"API 返回空 choices: {json.dumps(data)[:200]}")
+
+                message = choices[0].get("message") or {}
+                content = message.get("content") or ""
+
+                # 记录 token 用量
+                self._record_usage(data)
+
+                # 成功 → 重置熔断计数
+                self._consecutive_failures = 0
+
                 return content.strip() if content else ""
+
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                self._consecutive_failures += 1
+                if attempt < self.max_retries:
+                    delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "API 超时 (第 %d/%d 次)，%.1fs 后重试",
+                        attempt + 1, self.max_retries, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error("API 超时，已达最大重试次数 (%d)", self.max_retries)
+
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                self._consecutive_failures += 1
+                status_code = getattr(e.response, "status_code", 0)
+
+                # 4xx 错误不重试（客户端错误）
+                if 400 <= status_code < 500:
+                    logger.error("API 客户端错误 (HTTP %d): %s", status_code, e)
+                    try:
+                        error_body = e.response.json()
+                        logger.error("  错误详情: %s", json.dumps(error_body, ensure_ascii=False)[:300])
+                    except Exception:
+                        pass
+                    # 429 (Rate Limit) 仍然重试
+                    if status_code == 429 and attempt < self.max_retries:
+                        delay = DEFAULT_RETRY_BASE_DELAY * (2 ** (attempt + 1))  # 加倍等待
+                        logger.warning("触发限流，%.1fs 后重试", delay)
+                        time.sleep(delay)
+                        continue
+                    break  # 其他 4xx 不重试
+
+                # 5xx 重试
+                if attempt < self.max_retries:
+                    delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "API 服务端错误 HTTP %d (第 %d/%d 次)，%.1fs 后重试",
+                        status_code, attempt + 1, self.max_retries, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error("API 服务端错误，已达最大重试次数 (%d)", self.max_retries)
 
             except Exception as e:
                 last_error = e
+                self._consecutive_failures += 1
                 if attempt < self.max_retries:
                     delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
                     logger.warning(
@@ -198,6 +277,14 @@ class LLMClient:
                         "API 失败，已达最大重试次数 (%d): %s",
                         self.max_retries, e,
                     )
+
+        # 检查是否触发熔断
+        if self._consecutive_failures >= self._circuit_failure_threshold:
+            self._circuit_open_until = time.time() + self._circuit_cooldown_sec
+            logger.critical(
+                "连续 %d 次失败，熔断器已打开，冷却 %ds",
+                self._consecutive_failures, self._circuit_cooldown_sec,
+            )
 
         raise RuntimeError(
             f"LLM 调用失败（已重试 {self.max_retries} 次）: {last_error}"
@@ -297,14 +384,56 @@ class LLMClient:
             time.sleep(self._min_interval - elapsed)
         self._last_call_time = time.time()
 
+    def _is_circuit_open(self) -> bool:
+        """检查熔断器是否打开。"""
+        if self._circuit_open_until > time.time():
+            return True
+        # 冷却期已过，复位
+        if self._circuit_open_until > 0:
+            self._circuit_open_until = 0.0
+            self._consecutive_failures = 0
+            logger.info("熔断器已复位")
+        return False
+
+    def _record_usage(self, data: dict):
+        """从 API 响应中提取并累加 token 用量。"""
+        usage = data.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens") or 0
+        completion_tokens = usage.get("completion_tokens") or 0
+        self._total_prompt_tokens += prompt_tokens
+        self._total_completion_tokens += completion_tokens
+
     def clear_history(self):
         """清空多轮对话历史。"""
         self._history.clear()
+
+    def reset_circuit(self):
+        """手动复位熔断器。"""
+        self._circuit_open_until = 0.0
+        self._consecutive_failures = 0
 
     @property
     def history(self) -> List[Dict[str, str]]:
         """返回当前对话历史（只读副本）。"""
         return list(self._history)
+
+    @property
+    def token_usage(self) -> dict:
+        """返回累计 token 用量统计。"""
+        return {
+            "total_prompt_tokens": self._total_prompt_tokens,
+            "total_completion_tokens": self._total_completion_tokens,
+            "total_tokens": self._total_prompt_tokens + self._total_completion_tokens,
+        }
+
+    @property
+    def circuit_status(self) -> dict:
+        """返回熔断器状态。"""
+        return {
+            "is_open": self._is_circuit_open(),
+            "consecutive_failures": self._consecutive_failures,
+            "cooldown_remaining_s": max(0, int(self._circuit_open_until - time.time())),
+        }
 
     # ----------------------------------------------------------
     # 工厂方法
