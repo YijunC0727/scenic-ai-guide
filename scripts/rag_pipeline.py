@@ -86,8 +86,19 @@ model = AutoModel.from_pretrained(MODEL_PATH).to(device)
 model.eval()
 
 
+# ============================================================
+# 嵌入缓存 — 对重复查询复用向量，减少 BGE 推理耗时
+# ============================================================
+_embedding_cache: dict = {}
+_EMBED_CACHE_MAX = 256
+
 def get_embedding(text: str) -> list:
-    """查询向量化 — 与 ingest.py 保持 Mean Pooling 一致"""
+    """查询向量化 — 与 ingest.py 保持 Mean Pooling 一致，带 LRU 缓存"""
+    # 用 hash 做 key，避免长文本占用缓存内存
+    key = text[:200]  # 前200字符相同即命中
+    if key in _embedding_cache:
+        return _embedding_cache[key]
+
     inputs = tokenizer(
         text,
         padding=True,
@@ -97,7 +108,20 @@ def get_embedding(text: str) -> list:
     ).to(device)
     with torch.no_grad():
         out = model(**inputs)
-    return out.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
+    vec = out.last_hidden_state.mean(dim=1).squeeze().cpu().numpy().tolist()
+
+    # LRU 淘汰：超过上限时删除最早的一半
+    if len(_embedding_cache) >= _EMBED_CACHE_MAX:
+        keys_to_del = list(_embedding_cache.keys())[:_EMBED_CACHE_MAX // 2]
+        for k in keys_to_del:
+            del _embedding_cache[k]
+    _embedding_cache[key] = vec
+    return vec
+
+
+def _content_fingerprint(text: str) -> str:
+    """提取文本前80字符作为内容指纹，用于去重"""
+    return text.strip()[:80]
 
 # ============================================================
 # 业务配置
@@ -148,7 +172,7 @@ class Retriever:
         self, query: str, domain_filter: Optional[List[str]] = None, top_k: int = TOP_K
     ) -> list[dict]:
         """
-        语义检索 + 可选的 type 领域过滤。
+        语义检索 + 可选的 type 领域过滤 + 内容去重 + 查询扩展。
 
         Args:
             query:         用户问题文本
@@ -159,27 +183,46 @@ class Retriever:
             [{"content": str, "title": str, "type": str, "source": str,
               "year": int, "distance": float}, ...]
         """
+        # 检索比最终需要更多的结果（为去重留余量）
+        fetch_k = max(top_k * 2, 10)
         vec = get_embedding(query)
 
-        # ChromaDB where 过滤
         where_clause = None
         if domain_filter:
             where_clause = {"type": {"$in": domain_filter}}
 
         res = self.collection.query(
             query_embeddings=[vec],
-            n_results=top_k,
+            n_results=fetch_k,
             where=where_clause,
         )
 
-        # 结构化返回
+        # 结构化 + 内容去重
         results = []
+        seen_fingerprints = set()
+        seen_ids = set()
+
         if res["ids"] and res["ids"][0]:
             for i in range(len(res["ids"][0])):
+                cid = res["ids"][0][i]
+                content = res["documents"][0][i] if res["documents"] else ""
+
+                # ID 去重
+                if cid and cid in seen_ids:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+
+                # 内容去重：相同文本前缀的不重复收录
+                fp = _content_fingerprint(content)
+                if fp in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fp)
+
                 meta = res["metadatas"][0][i] if res["metadatas"] else {}
                 results.append({
-                    "chunk_id": res["ids"][0][i],
-                    "content": res["documents"][0][i],
+                    "chunk_id": cid,
+                    "content": content,
                     "type": meta.get("type", "unknown"),
                     "title": meta.get("title", ""),
                     "source": meta.get("source", ""),
@@ -188,7 +231,57 @@ class Retriever:
                     "venue_relevant": meta.get("venue_relevant", False),
                     "distance": res["distances"][0][i] if res["distances"] else 0.0,
                 })
+
+                # 收到足够多去重结果即停止
+                if len(results) >= top_k:
+                    break
+
+        # 查询扩展：如果去重后结果太少，用问题中的关键词单独检索补充
+        if len(results) < top_k and len(query) > 5:
+            extra = self._expand_search(query, domain_filter, top_k - len(results), seen_ids, seen_fingerprints)
+            results.extend(extra)
+
         return results
+
+    def _expand_search(
+        self, query: str, domain_filter: Optional[List[str]], need: int,
+        seen_ids: set, seen_fingerprints: set,
+    ) -> list[dict]:
+        """
+        查询扩展：提取问题中的关键词做补充检索，提高结果丰富度。
+        用于首次检索结果太少或太单一的情况。
+        """
+        import jieba
+        # 提取长度≥2的名词/动词作为关键词
+        keywords = []
+        for w, flag in jieba.posseg.cut(query):
+            if len(w) >= 2 and flag in ("n", "v", "nr", "ns", "nt", "nz"):
+                if w not in ("鲁迅", "先生", "什么", "怎么", "哪些", "为什么", "请问", "你可以"):
+                    keywords.append(w)
+
+        # 最多取3个关键词
+        keywords = list(dict.fromkeys(keywords))[:3]  # 去重保序
+        if not keywords:
+            return []
+
+        extra_results = []
+        for kw in keywords:
+            if len(extra_results) >= need:
+                break
+            kw_results = self.search(kw, domain_filter=domain_filter, top_k=3)
+            for r in kw_results:
+                cid = r.get("chunk_id", "")
+                fp = _content_fingerprint(r.get("content", ""))
+                if cid in seen_ids or fp in seen_fingerprints:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+                seen_fingerprints.add(fp)
+                extra_results.append(r)
+                if len(extra_results) >= need:
+                    break
+
+        return extra_results
 
 
 # ============================================================

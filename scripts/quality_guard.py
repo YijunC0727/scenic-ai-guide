@@ -125,6 +125,14 @@ class QualityGuard:
                 retry_reason="空回答",
             )
 
+        # 0. 完整性检查 — 截断/未完成的回答直接触发 RETRY
+        truncated = self._check_truncation(response)
+        if truncated:
+            return GuardReport(
+                result=GuardResult.RETRY,
+                retry_reason=f"回答疑似截断: {truncated}",
+            )
+
         # 1. 幻觉检测
         h_report = self.hallucination_checker.check(
             llm_response=response,
@@ -201,6 +209,51 @@ class QualityGuard:
             consistency_report=c_report,
             details=details,
         )
+
+    @staticmethod
+    def _check_truncation(response: str) -> str:
+        """
+        检测回答是否被截断/未完成。
+
+        Returns:
+            空字符串表示正常；非空表示截断原因。
+        """
+        if not response:
+            return ""
+
+        text = response.strip()
+
+        # 1. 末句无标点结尾（正常中文句子应以 。！？…～」" 等结尾）
+        valid_endings = ("。", "！", "？", "…", "～", "」", "』", "”", "罢", "了", "呢", "吗", "啊")
+        if not any(text.endswith(e) for e in valid_endings):
+            # 允许数字/英文结尾（可能是引用/名称）
+            last_char = text[-1]
+            if last_char.isalpha() or last_char.isdigit():
+                pass  # 可能是正常的
+            else:
+                return f"末句无标点结尾 (最后字符: '{last_char}')"
+
+        # 2. 明显截断标记
+        truncation_markers = ["（未完", "(未完", "（待续", "(待续", "[待续", "……（"]
+        for marker in truncation_markers:
+            if marker in text[-100:]:
+                return f"含截断标记: {marker}"
+
+        # 3. 末句过短且无句号（可能是被中途截断）
+        last_sentence = text.split("。")[-1].strip()
+        if len(last_sentence) < 10 and "。" not in last_sentence and "！" not in last_sentence:
+            # 非常短的末句且无标点，可能是截断
+            if len(last_sentence) > 0 and not last_sentence[-1] in ("…", "～", "？"):
+                # 但允许意图性短句（如"再见。"已被排除上述）
+                pass
+
+        # 4. 回答过短（< 20字），但内容不完整
+        if len(text) < 20:
+            # 太短的回答可能是截断，检查是否以完整句式结尾
+            if not any(text.endswith(e) for e in valid_endings):
+                return "回答过短且无正常结尾"
+
+        return ""
 
     def amend(self, response: str, amend_text: str) -> str:
         """为回答追加边界声明"""
