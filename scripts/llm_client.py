@@ -34,7 +34,7 @@ import os
 import json
 import time
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import requests
 from dotenv import load_dotenv
@@ -54,6 +54,7 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0     # 秒，指数退避基数
 DEFAULT_MIN_INTERVAL = 0.3          # 秒，两次调用最小间隔（简单限流）
 DEFAULT_TIMEOUT = 30                # 秒
+SAFE_MESSAGE_MAX_TOTAL_CHARS = 12000  # messages总字符安全上限，防止超长报错
 
 # 常用 provider → base_url 映射
 PROVIDER_URLS = {
@@ -143,6 +144,46 @@ class LLMClient:
         )
 
     # ----------------------------------------------------------
+    # 工具方法（来自 hjh PR#19 — 客户端加固）
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _clean_llm_output(text: str) -> str:
+        """清洗模型输出：剔除 markdown ``` 代码块标记、多余换行空格。"""
+        if not text:
+            return ""
+        s = text.strip()
+        if s.startswith("```"):
+            lines = s.splitlines()
+            filtered = [ln for ln in lines if not ln.strip().startswith("```")]
+            s = "\n".join(filtered).strip()
+        return s
+
+    @staticmethod
+    def _safe_truncate_messages(messages: List[Dict[str, str]], max_chars: int) -> List[Dict[str, str]]:
+        """安全截断 messages 总字符数，避免请求 payload 过大。"""
+        total = sum(len(m.get("content", "")) for m in messages)
+        if total <= max_chars:
+            return messages
+        logger.warning(f"messages总字符 {total} 超过安全阈值{max_chars}，执行截断")
+        system_msg = None
+        chat_msgs = []
+        for m in messages:
+            if m["role"] == "system":
+                system_msg = m
+            else:
+                chat_msgs.append(m)
+        while chat_msgs and sum(
+            len(m.get("content", "")) for m in ([system_msg] if system_msg else []) + chat_msgs
+        ) > max_chars:
+            chat_msgs.pop(0)
+        out = []
+        if system_msg:
+            out.append(system_msg)
+        out.extend(chat_msgs)
+        return out
+
+    # ----------------------------------------------------------
     # 核心接口
     # ----------------------------------------------------------
 
@@ -180,7 +221,7 @@ class LLMClient:
 
         payload = {
             "model": self.model,
-            "messages": messages,
+            "messages": self._safe_truncate_messages(messages, SAFE_MESSAGE_MAX_TOTAL_CHARS),
             "temperature": temp,
             "max_tokens": mt,
             "stream": False,
@@ -208,6 +249,7 @@ class LLMClient:
 
                 message = choices[0].get("message") or {}
                 content = message.get("content") or ""
+                content = self._clean_llm_output(content)
 
                 # 记录 token 用量
                 self._record_usage(data)
