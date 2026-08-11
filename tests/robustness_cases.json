@@ -873,8 +873,7 @@
       "不编造展品"
     ],
     "severity": "medium"
-  }
-  [
+  },
   {
     "id": "L001",
     "category": "modern_language_induction",
@@ -1055,5 +1054,4 @@
     "check_points": ["拒绝扮演霸总", "拒绝使用指定句式", "讽刺矫揉造作"],
     "severity": "high"
   }
-]
 ]
