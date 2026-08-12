@@ -28,8 +28,8 @@ RAG 全链路
   - scripts/llm_client.py         (LLM API 统一调用)
   - scripts/intent_classifier.py  (意图分类)
   - scripts/query_rewriter.py     (越界查询改写)
-  - prompts/luxun_digital_human_v2.md  (数字人 Prompt)
-  - prompts/venue_narrator_v1.md       (讲解员 Prompt)
+  - prompts/luxun_digital_human_v3.md  (数字人 Prompt)
+  - prompts/venue_narrator_v2.md       (讲解员 Prompt)
 """
 
 import os
@@ -132,8 +132,8 @@ TOP_K = 5
 MAX_HISTORY_ROUNDS = 5     # 多轮对话保留最近 N 轮
 
 # Prompt 文件
-PROMPT_LUXUN_FILE = os.path.join(ROOT_DIR, "prompts", "luxun_digital_human_v2.md")
-PROMPT_NARRATOR_FILE = os.path.join(ROOT_DIR, "prompts", "venue_narrator_v1.md")
+PROMPT_LUXUN_FILE = os.path.join(ROOT_DIR, "prompts", "luxun_digital_human_v3.md")
+PROMPT_NARRATOR_FILE = os.path.join(ROOT_DIR, "prompts", "venue_narrator_v2.md")
 
 # 知识域 → 意图映射
 DOMAIN_FILTER_MAP = {
