@@ -3,11 +3,12 @@ RAG 全链路
 ==================
 意图分类 → 越界改写 → 知识检索 → Prompt 拼接 → LLM 生成 → 多轮对话
 
-越界方案（4层防护）：
+越界方案（5层防护）：
   Layer 1: 意图分类器拦截 — reject_time 高置信度直接拒绝
   Layer 2: 查询改写拆解 — 中置信度时，将现代概念映射为时间安全子查询
   Layer 3: 多轮检索合并 — 多个子查询分别检索，合并去重
   Layer 4: System Prompt 时间边界 — 鲁迅只知道1936年前的事
+  Layer 5: QualityGuard 回答后卫 — 幻觉检测 + 一致性校验 + 重试/兜底
 
 架构：
   用户输入 → intent_classifier (5分类)
@@ -16,6 +17,7 @@ RAG 全链路
            → ChromaDB 语义检索
            → 拼接 System Prompt + Context + User Query
            → LLM 生成
+           → QualityGuard后卫校验
            → 输出 + 对话历史记录
 
 用法：
@@ -27,6 +29,7 @@ RAG 全链路
   - scripts/llm_client.py         (LLM API 统一调用)
   - scripts/intent_classifier.py  (意图分类)
   - scripts/query_rewriter.py     (越界查询改写)
+  - scripts/quality_guard.py      (后卫校验 QualityGuard)
   - prompts/luxun_digital_human_v3.md  (数字人 Prompt)
   - prompts/venue_narrator_v2.md       (讲解员 Prompt)
 """
@@ -44,6 +47,7 @@ import json
 import time
 import logging
 import argparse
+import jieba
 from typing import Optional, List, Dict
 from dataclasses import dataclass, field
 
@@ -62,14 +66,19 @@ import torch
 from intent_classifier import classify
 from llm_client import LLMClient
 from query_rewriter import QueryRewriter, RewriteResult
+from quality_guard import QualityGuard, GuardResult
+
+# ============新增兜底话术库导入============
+from prompts.fallback_responses import get_fallback_response, FaultType, RoleType
+# 从llm_client取出熔断器状态导出函数
+from llm_client import get_circuit_status
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag_pipeline")
 
 # ============================================================
-# 模型配置【与入库脚本完全对齐 repo_id + cache_dir】
+# 模型配置【BGE L2归一化；repo_id联网缓存模式，规避老版本tokenizer bug】
 # ============================================================
-# 移除旧的本地MODEL_PATH模式，使用repo_id联网缓存模式，规避tokenizer/model_type bug
 REPO_ID = "BAAI/bge-small-zh-v1.5"
 CACHE_FOLDER = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
 
@@ -79,11 +88,22 @@ tokenizer = AutoTokenizer.from_pretrained(REPO_ID, cache_dir=CACHE_FOLDER)
 model = AutoModel.from_pretrained(REPO_ID, cache_dir=CACHE_FOLDER).to(device)
 model.eval()
 
+# ============================================================
+# 嵌入缓存 — 对重复查询复用向量，减少 BGE 推理耗时
+# ============================================================
+_embedding_cache: dict = {}
+_EMBED_CACHE_MAX = 256
+
 def get_embedding(text: str) -> list:
     """
-    查询向量化，和入库脚本get_embedding逻辑100%对齐
-    BGE官方：取CLS输出 + L2归一化
+    查询向量化，和入库脚本逻辑100%对齐
+    BGE官方：取CLS输出 + L2归一化，带LRU缓存
     """
+    # 用hash key，避免长文本占用缓存内存
+    key = text[:200]
+    if key in _embedding_cache:
+        return _embedding_cache[key]
+
     inputs = tokenizer(
         text,
         padding=True,
@@ -95,7 +115,20 @@ def get_embedding(text: str) -> list:
         out = model(**inputs)
     vec = out.last_hidden_state[:, 0]
     vec = torch.nn.functional.normalize(vec, p=2, dim=1).squeeze()
-    return vec.cpu().numpy().tolist()
+    vec_list = vec.cpu().numpy().tolist()
+
+    # LRU 淘汰：超过上限时删除最早的一半
+    if len(_embedding_cache) >= _EMBED_CACHE_MAX:
+        keys_to_del = list(_embedding_cache.keys())[:_EMBED_CACHE_MAX // 2]
+        for k in keys_to_del:
+            del _embedding_cache[k]
+    _embedding_cache[key] = vec_list
+    return vec_list
+
+
+def _content_fingerprint(text: str) -> str:
+    """提取文本前80字符作为内容指纹，用于去重"""
+    return text.strip()[:80]
 
 # ============================================================
 # 业务配置
@@ -131,7 +164,7 @@ REJECT_IRRELEVANT_RESPONSE = (
 
 
 # ============================================================
-# 检索器【不再内部重复加载模型，复用全局tokenizer/model/get_embedding】
+# 检索器【BGE+ChromaDB检索 +领域过滤 + 内容去重 + jieba查询扩展】
 # ============================================================
 
 class Retriever:
@@ -146,7 +179,7 @@ class Retriever:
         self, query: str, domain_filter: Optional[List[str]] = None, top_k: int = TOP_K
     ) -> list[dict]:
         """
-        语义检索 + 可选的 type 领域过滤。
+        语义检索 + 可选的 type 领域过滤 + 内容去重 + 查询扩展。
 
         Args:
             query:         用户问题文本
@@ -157,27 +190,46 @@ class Retriever:
             [{"content": str, "title": str, "type": str, "source": str,
               "year": int, "distance": float}, ...]
         """
+        # 检索比最终需要更多的结果（为去重留余量）
+        fetch_k = max(top_k * 2, 10)
         vec = get_embedding(query)
 
-        # ChromaDB where 过滤
         where_clause = None
         if domain_filter:
             where_clause = {"type": {"$in": domain_filter}}
 
         res = self.collection.query(
             query_embeddings=[vec],
-            n_results=top_k,
+            n_results=fetch_k,
             where=where_clause,
         )
 
-        # 结构化返回
+        # 结构化 + 内容去重
         results = []
+        seen_fingerprints = set()
+        seen_ids = set()
+
         if res["ids"] and res["ids"][0]:
             for i in range(len(res["ids"][0])):
+                cid = res["ids"][0][i]
+                content = res["documents"][0][i] if res["documents"] else ""
+
+                # ID 去重
+                if cid and cid in seen_ids:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+
+                # 内容去重：相同文本前缀的不重复收录
+                fp = _content_fingerprint(content)
+                if fp in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fp)
+
                 meta = res["metadatas"][0][i] if res["metadatas"] else {}
                 results.append({
-                    "chunk_id": res["ids"][0][i],
-                    "content": res["documents"][0][i],
+                    "chunk_id": cid,
+                    "content": content,
                     "type": meta.get("type", "unknown"),
                     "title": meta.get("title", ""),
                     "source": meta.get("source", ""),
@@ -186,7 +238,56 @@ class Retriever:
                     "venue_relevant": meta.get("venue_relevant", False),
                     "distance": res["distances"][0][i] if res["distances"] else 0.0,
                 })
+
+                # 收到足够多去重结果即停止
+                if len(results) >= top_k:
+                    break
+
+        # 查询扩展：如果去重后结果太少，用问题中的关键词单独检索补充
+        if len(results) < top_k and len(query) > 5:
+            extra = self._expand_search(query, domain_filter, top_k - len(results), seen_ids, seen_fingerprints)
+            results.extend(extra)
+
         return results
+
+    def _expand_search(
+        self, query: str, domain_filter: Optional[List[str]], need: int,
+        seen_ids: set, seen_fingerprints: set,
+    ) -> list[dict]:
+        """
+        查询扩展：提取问题中的关键词做补充检索，提高结果丰富度。
+        用于首次检索结果太少或太单一的情况。
+        """
+        # 提取长度≥2的名词/动词作为关键词
+        keywords = []
+        for w, flag in jieba.posseg.cut(query):
+            if len(w) >= 2 and flag in ("n", "v", "nr", "ns", "nt", "nz"):
+                if w not in ("鲁迅", "先生", "什么", "怎么", "哪些", "为什么", "请问", "你可以"):
+                    keywords.append(w)
+
+        # 最多取3个关键词
+        keywords = list(dict.fromkeys(keywords))[:3]  # 去重保序
+        if not keywords:
+            return []
+
+        extra_results = []
+        for kw in keywords:
+            if len(extra_results) >= need:
+                break
+            kw_results = self.search(kw, domain_filter=domain_filter, top_k=3)
+            for r in kw_results:
+                cid = r.get("chunk_id", "")
+                fp = _content_fingerprint(r.get("content", ""))
+                if cid in seen_ids or fp in seen_fingerprints:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+                seen_fingerprints.add(fp)
+                extra_results.append(r)
+                if len(extra_results) >= need:
+                    break
+
+        return extra_results
 
 
 # ============================================================
@@ -246,7 +347,7 @@ def format_context(chunks: list[dict], max_chunks: int = 6) -> str:
 
 
 # ============================================================
-# 对话状态【修复版】
+# 对话状态【修复版：强类型转换，杜绝非字符串存入history】
 # ============================================================
 
 @dataclass
@@ -257,7 +358,7 @@ class ConversationState:
     turn_count: int = 0
 
     def add(self, user: str, assistant: str):
-        # ✏️修复：强制转为字符串，禁止dict、对象存入content，避免API400
+        # ✏️强制转为字符串，禁止dict、对象存入content，避免API400
         user = str(user)
         assistant = str(assistant)
         self.history.append({"role": "user", "content": user})
@@ -290,7 +391,7 @@ class ConversationState:
 # ============================================================
 
 class RAGPipeline:
-    """RAG 全链路：意图分类 → 检索 → Prompt → LLM → 对话状态"""
+    """RAG 全链路：意图分类 → 检索 → Prompt → LLM → QualityGuard后卫 → 对话状态"""
 
     def __init__(self):
         logger.info("=" * 50)
@@ -301,9 +402,18 @@ class RAGPipeline:
         self.prompts = PromptManager()
         self.llm = LLMClient()
         self.rewriter = QueryRewriter(llm_client=self.llm)
+        self.guard = QualityGuard()
         self.state = ConversationState()
+        self.last_debug = {}  # 调试信息，每次 ask() 后更新
 
-        logger.info("RAG 全链路就绪（含越界改写层）。")
+        logger.info("RAG 全链路就绪（含越界改写层 + QualityGuard后卫）。")
+
+    @staticmethod
+    def _intent_to_role(intent: str) -> RoleType:
+        """意图映射为兜底话术角色"""
+        if intent == "narrator":
+            return "guide"
+        return "luxun"
 
     # ---- 检索策略 ----
 
@@ -437,11 +547,12 @@ class RAGPipeline:
         """
         处理一轮对话。
 
-        越界方案（4层）：
+        越界方案（5层）：
           Layer 1: intent_classifier 拦截高置信越界
           Layer 2: query_rewriter 改写中置信越界
           Layer 3: 多子查询检索合并
           Layer 4: System Prompt 时间边界
+          Layer 5: QualityGuard 回答后卫
 
         Args:
             user_input: 用户原始输入
@@ -458,6 +569,17 @@ class RAGPipeline:
                 return "（请输入你的问题）", []
             return "（请输入你的问题）"
 
+        t_start = time.time()
+        self.last_debug = {
+            "intent": "", "confidence": 0, "reason": "", "matched": [],
+            "time_boundary": False, "time_warning": "",
+            "rewrite_used": False, "rewrite_concepts": [], "rewrite_queries": [],
+            "rewrite_fallback": "",
+            "chunks": [], "chunk_count": 0,
+            "elapsed_ms": 0, "reply_len": 0, "error": None,
+            "guard_status": "", "guard_details": {},
+        }
+
         # ── Step 1: 意图分类 (Layer 1) ──
         if force_mode is not None:
             intent = force_mode
@@ -467,6 +589,15 @@ class RAGPipeline:
             intent_result = classify(user_input)
             intent = intent_result["intent"]
             self.state.current_intent = intent
+
+        self.last_debug.update({
+            "intent": intent,
+            "confidence": intent_result.get("confidence", 0),
+            "reason": intent_result.get("reason", ""),
+            "matched": intent_result.get("matched", [])[:5],
+            "time_boundary": intent_result.get("time_aware", False),
+            "time_warning": intent_result.get("time_warning", ""),
+        })
 
         if verbose:
             logger.info("意图: %s (conf=%.2f) reason=%s",
@@ -479,6 +610,8 @@ class RAGPipeline:
         # 2a. 无关/恶意 → 直接拒绝
         if intent == "reject_irrelevant":
             reply = REJECT_IRRELEVANT_RESPONSE
+            self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
+            self.last_debug["reply_len"] = len(reply)
             self.state.add(user_input, reply)
             if return_retrieval:
                 return reply, []
@@ -493,21 +626,26 @@ class RAGPipeline:
         chunks = []
         if rewrite_result and rewrite_result.can_rewrite and rewrite_result.sub_queries:
             # ── Layer 3: 多子查询检索合并 ──
-            # 用改写后的子查询检索，意图统一按"当前意图或 ambiguous"处理
             search_intent = intent if intent not in ("reject_time",) else "ambiguous"
             chunks = self._retrieve_multi(
                 rewrite_result.sub_queries, search_intent
             )
+
+            self.last_debug.update({
+                "rewrite_used": True,
+                "rewrite_concepts": rewrite_result.modern_concepts[:5] if rewrite_result.modern_concepts else [],
+                "rewrite_queries": rewrite_result.sub_queries[:5],
+            })
 
             # 构建改写说明
             if rewrite_result.modern_concepts:
                 concepts_str = "、".join(rewrite_result.modern_concepts[:3])
                 subs_str = "；".join(rewrite_result.sub_queries[:3])
                 rewrite_notice = (
-                        "\n\n[系统提醒：用户问题涉及「" + concepts_str + "」等概念，"
-                                                                       "这些在1936年后才出现。已将问题改写为：「" + subs_str + "」。"
-                                                                                                                            "请基于参考资料回答这些改写后的问题，并在回答开头用鲁迅口吻简要说明"
-                                                                                                                            "你只了解1936年前的事物。]"
+                    "\n\n[系统提醒：用户问题涉及「" + concepts_str + "」等概念，"
+                    "这些在1936年后才出现。已将问题改写为：「" + subs_str + "」。"
+                    "请基于参考资料回答这些改写后的问题，并在回答开头用鲁迅口吻简要说明"
+                    "你只了解1936年前的事物。]"
                 )
         elif rewrite_result and not rewrite_result.can_rewrite:
             # 改写失败 → 用越界话术回复
@@ -516,6 +654,12 @@ class RAGPipeline:
                 "我生于光绪七年，殁于民国二十五年，怕是未曾见过。"
                 "大抵是我所不能知道的事了。"
             )
+            self.last_debug.update({
+                "rewrite_used": True,
+                "rewrite_fallback": "改写失败，使用越界话术",
+            })
+            self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
+            self.last_debug["reply_len"] = len(reply)
             self.state.add(user_input, reply)
             if return_retrieval:
                 return reply, []
@@ -529,6 +673,18 @@ class RAGPipeline:
             for i, c in enumerate(chunks[:3]):
                 logger.info("  [%d] type:%s | %s | dist:%.2f",
                             i + 1, c["type"], c["title"][:40], c["distance"])
+
+        # 存储检索结果摘要供调试面板使用
+        chunk_summaries = []
+        for c in chunks[:5]:
+            chunk_summaries.append({
+                "title": (c.get("title") or "")[:60],
+                "type": c.get("type", ""),
+                "distance": round(c.get("distance", 0), 3),
+                "snippet": (c.get("content") or "")[:100],
+            })
+        self.last_debug["chunks"] = chunk_summaries
+        self.last_debug["chunk_count"] = len(chunks)
 
         # ── Layer 4: System Prompt 时间边界 ──
         if intent == "narrator":
@@ -554,66 +710,124 @@ class RAGPipeline:
         context_str = format_context(chunks)
 
         # ── Step 3: 调用 LLM ──
-        reply = ""
-        try:
+        def _call_llm(temp_modifier: float = 0.0):
+            """内部函数：用指定参数调用 LLM，处理返回dict"""
+            temp = max(0.05, 0.3 + temp_modifier)
             if len(self.state.history) >= 2:
-                # 多轮对话模式
                 messages = self.state.to_messages(system_prompt)
                 user_content = (
                     f"【参考资料】\n{context_str}\n\n"
                     f"【用户问题】\n{user_input}"
                 ) if context_str else user_input
                 messages.append({"role": "user", "content": user_content})
-                resp = self.llm.call(messages)
-                # ✏️修复：解析返回字典，提取content，不能直接存dict
+                resp = self.llm.call(messages, temperature=temp)
                 if isinstance(resp, dict):
                     if resp.get("success"):
-                        reply = resp.get("content", "")
+                        return resp.get("content", "")
                     else:
                         raise RuntimeError(resp.get("content", "LLM调用返回success=false"))
                 else:
-                    reply = resp
+                    return resp
             else:
-                # 首轮：用 chat 方法
                 resp = self.llm.chat(
                     system_prompt=system_prompt,
                     context=context_str,
                     user_query=user_input,
+                    temperature=temp,
                 )
-                # ✏️修复：解析返回字典
                 if isinstance(resp, dict):
                     if resp.get("success"):
-                        reply = resp.get("content", "")
+                        return resp.get("content", "")
                     else:
                         raise RuntimeError(resp.get("content", "LLM调用返回success=false"))
                 else:
-                    reply = resp
+                    return resp
 
+        reply = None
+        guard_error = None
+        current_role = self._intent_to_role(intent)
+        try:
+            reply = _call_llm()
         except Exception as e:
-            logger.error("LLM 调用失败: %s", e, exc_info=True)
-            reply = f"（回答生成失败：{e}）"
-            # ✏️修复：异常必须先写入历史，再抛出，避免历史断层
-            self.state.add(user_input, reply)
-            if return_retrieval:
-                return reply, chunks
-            return reply
+            logger.error("LLM 调用失败: %s", e)
+            guard_error = str(e)
+            # =========替换为新的api_error兜底话术========
+            reply = get_fallback_response("api_error", current_role)
+            self.last_debug["error"] = guard_error
+            self.last_debug["guard_status"] = "FAIL"
+
+        # ── Step 3.5: QualityGuard 回答后校验 (Layer 5) ──
+        if not guard_error and reply:
+            guard_report = self.guard.evaluate(
+                response=reply,
+                context=chunks,
+                intent=intent,
+                query=user_input,
+            )
+
+            self.last_debug["guard_status"] = guard_report.result.value
+            self.last_debug["guard_details"] = guard_report.details
+
+            if guard_report.result == GuardResult.RETRY:
+                # 重试一次（降低 temperature 以获得更保守的回答）
+                logger.warning(
+                    "QualityGuard RETRY: %s — 正在重试 (temperature↓)",
+                    guard_report.retry_reason,
+                )
+                self.last_debug["guard_details"]["retry_reason"] = guard_report.retry_reason
+
+                try:
+                    retry_reply = _call_llm(temp_modifier=-0.15)
+                    retry_report = self.guard.evaluate(
+                        response=retry_reply,
+                        context=chunks,
+                        intent=intent,
+                        query=user_input,
+                    )
+
+                    if retry_report.result == GuardResult.RETRY:
+                        # 二次不合格 → low_quality兜底话术
+                        logger.warning("QualityGuard 重试仍不合格 → low_quality兜底话术")
+                        reply = get_fallback_response("low_quality", current_role)
+                        self.last_debug["guard_status"] = "FALLBACK"
+                        self.last_debug["guard_details"]["final_action"] = "fallback"
+                    elif retry_report.result == GuardResult.AMEND:
+                        reply = self.guard.amend(retry_reply, retry_report.amend_text)
+                        self.last_debug["guard_status"] = "AMEND"
+                        self.last_debug["guard_details"]["final_action"] = "amend_after_retry"
+                    else:
+                        reply = retry_reply
+                        self.last_debug["guard_status"] = "PASS"
+                        self.last_debug["guard_details"]["final_action"] = "pass_after_retry"
+                except Exception as e:
+                    logger.error("QualityGuard 重试失败: %s", e)
+                    reply = get_fallback_response("api_error", current_role)
+                    self.last_debug["guard_status"] = "FALLBACK"
+
+            elif guard_report.result == GuardResult.AMEND:
+                reply = self.guard.amend(reply, guard_report.amend_text)
+                logger.info("QualityGuard AMEND: 已追加边界声明")
 
         # ── Step 4: 保存对话历史 ──
         self.state.add(user_input, reply)
+
+        self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
+        self.last_debug["reply_len"] = len(reply)
+        # 追加熔断器状态，前端调试面板读取
+        self.last_debug["circuit_status"] = get_circuit_status()
 
         # 返回分支
         if return_retrieval:
             return reply, chunks
         return reply
+
     # ---- 越界处理 ----
 
     def _handle_reject_time(self, user_input: str, intent_result: dict) -> str:
         """处理时间越界：用鲁迅口吻表达困惑，不检索知识库"""
-        # 根据匹配到的越界类型选择参考话术
         hint = REJECT_TIME_RESPONSE_HINTS.get("现代科技",
             "这大约是什么新奇的东西罢。我生于光绪七年，殁于民国二十五年，怕是未曾见过。大抵是我所不能知道的事了。")
 
-        # 构建越界 Prompt
         system_prompt = self.prompts.luxun + (
             "\n\n特别注意：用户问题涉及1936年后的概念或事物。"
             "请用鲁迅的口吻真诚地表达困惑，简短回应（2‑3句话即可）。"
@@ -625,7 +839,6 @@ class RAGPipeline:
                 context="（无相关知识——用户问题涉及1936年后的事物，鲁迅不可能知晓）",
                 user_query=user_input,
             )
-            # ✏️修复：解析返回字典
             if isinstance(resp, dict):
                 if resp.get("success"):
                     reply = resp.get("content","")

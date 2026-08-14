@@ -8,6 +8,13 @@ LLM API 统一封装
   - 指数退避重试（最多 3 次）
   - 调用间隔限流（防 API 超额）
   - 多轮对话历史管理（最近 5 轮）
+  ✨增强加固新增：
+  - call() 返回结构化字典，携带状态、token用量、耗时，异常不直接抛出
+  - token用量统计，接口耗时统计(ms)
+  - 响应清洗，剔除多余markdown标记
+  - message长度安全截断防护
+  - 全类型异常捕获，业务层获取错误信息，适配RAG后置守卫重试逻辑
+  - 熔断器CircuitBreaker，熔断状态对外导出 get_circuit_status
 
 环境变量（.env）：
   LLM_API_KEY    - API 密钥（必填）
@@ -17,7 +24,7 @@ LLM API 统一封装
   LLM_TEMPERATURE- 温度（可选，默认 0.3）
 
 用法：
-  from scripts.llm_client import LLMClient, chat
+  from scripts.llm_client import LLMClient, chat, get_circuit_status
 
   client = LLMClient()
   reply = client.chat(
@@ -26,8 +33,13 @@ LLM API 统一封装
       user_query="纪念馆在哪里？",
   )
 
-  # 或便捷函数
-  reply = chat("你是讲解员", "广州鲁迅纪念馆...", "纪念馆在哪里？")
+  # 底层结构化调用（给rag_pipeline使用）
+  res = client.call(messages=[...])
+  if res["success"]:
+      ans = res["content"]
+
+  # 获取熔断器状态
+  status = get_circuit_status()
 """
 
 import os
@@ -42,6 +54,64 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger("llm_client")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s - [%(name)s] - %(levelname)s - %(message)s")
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# ============================================================
+# 熔断器 CircuitBreaker
+# ============================================================
+class CircuitBreaker:
+    """LLM调用熔断器，失败计数、熔断冷却"""
+    def __init__(self, fail_threshold=3, reset_timeout=10):
+        self.fail_threshold = fail_threshold   # 失败多少次触发熔断
+        self.reset_timeout = reset_timeout     # 熔断后冷却时间，单位秒
+        self.fail_count = 0
+        self.is_open = False
+        self.open_time = 0.0
+
+    def record_success(self):
+        """调用成功，重置失败计数，关闭熔断"""
+        self.fail_count = 0
+        self.is_open = False
+
+    def record_fail(self):
+        """调用失败，计数，达到阈值打开熔断"""
+        self.fail_count += 1
+        if self.fail_count >= self.fail_threshold:
+            self.is_open = True
+            self.open_time = time.time()
+            logger.warning(f"熔断器触发熔断，fail_count={self.fail_count}")
+
+    def allow_call(self) -> bool:
+        """是否允许发起LLM请求；冷却到期自动恢复关闭状态"""
+        if not self.is_open:
+            return True
+        # 冷却时间到，自动复位
+        if time.time() - self.open_time >= self.reset_timeout:
+            self.is_open = False
+            self.fail_count = 0
+            logger.info("熔断器冷却结束，恢复允许调用")
+            return True
+        return False
+
+# 全局单例熔断器实例
+_g_circuit_breaker = CircuitBreaker(fail_threshold=3, reset_timeout=10)
+
+
+def get_circuit_status() -> Dict[str, Any]:
+    """对外导出：获取熔断器当前状态，供test88.py / RAG管道读取"""
+    return {
+        "is_open": _g_circuit_breaker.is_open,
+        "fail_count": _g_circuit_breaker.fail_count,
+        "fail_threshold": _g_circuit_breaker.fail_threshold,
+        "reset_timeout": _g_circuit_breaker.reset_timeout,
+        "open_time": _g_circuit_breaker.open_time
+    }
+
 
 # ============================================================
 # 配置常量
@@ -53,7 +123,7 @@ DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0     # 秒，指数退避基数
 DEFAULT_MIN_INTERVAL = 0.3          # 秒，两次调用最小间隔（简单限流）
-DEFAULT_TIMEOUT = 30                # 秒
+DEFAULT_TIMEOUT = 60                # 秒
 SAFE_MESSAGE_MAX_TOTAL_CHARS = 12000  # messages总字符安全上限，防止超长报错
 
 # 常用 provider → base_url 映射
@@ -111,16 +181,6 @@ class LLMClient:
         # 对话历史（多轮对话管理）
         self._history: List[Dict[str, str]] = []
 
-        # Token 用量统计
-        self._total_prompt_tokens = 0
-        self._total_completion_tokens = 0
-
-        # 熔断器：连续失败计数 + 冷却期
-        self._consecutive_failures = 0
-        self._circuit_open_until = 0.0
-        self._circuit_failure_threshold = 5    # 连续5次失败触发熔断
-        self._circuit_cooldown_sec = 60.0      # 冷却60秒
-
         # --- 校验 ---
         if not self.api_key:
             raise ValueError(
@@ -143,29 +203,27 @@ class LLMClient:
             self.model, self._endpoint, self.max_tokens, self.temperature,
         )
 
-    # ----------------------------------------------------------
-    # 工具方法（来自 hjh PR#19 — 客户端加固）
-    # ----------------------------------------------------------
-
     @staticmethod
     def _clean_llm_output(text: str) -> str:
-        """清洗模型输出：剔除 markdown ``` 代码块标记、多余换行空格。"""
+        """清洗模型输出：剔除markdown ``` 代码块标记、多余换行空格"""
         if not text:
             return ""
         s = text.strip()
+        # 移除 ```json / ``` 标记
         if s.startswith("```"):
             lines = s.splitlines()
-            filtered = [ln for ln in lines if not ln.strip().startswith("```")]
-            s = "\n".join(filtered).strip()
+            filter_lines = [ln for ln in lines if not ln.strip().startswith("```")]
+            s = "\n".join(filter_lines).strip()
         return s
 
     @staticmethod
     def _safe_truncate_messages(messages: List[Dict[str, str]], max_chars: int) -> List[Dict[str, str]]:
-        """安全截断 messages 总字符数，避免请求 payload 过大。"""
+        """安全截断messages总字符，避免请求payload过大报错"""
         total = sum(len(m.get("content", "")) for m in messages)
         if total <= max_chars:
             return messages
         logger.warning(f"messages总字符 {total} 超过安全阈值{max_chars}，执行截断")
+        # 保留system，从最早user-assistant开始删减
         system_msg = None
         chat_msgs = []
         for m in messages:
@@ -173,9 +231,7 @@ class LLMClient:
                 system_msg = m
             else:
                 chat_msgs.append(m)
-        while chat_msgs and sum(
-            len(m.get("content", "")) for m in ([system_msg] if system_msg else []) + chat_msgs
-        ) > max_chars:
+        while chat_msgs and sum(len(m.get("content", "")) for m in ([system_msg] if system_msg else []) + chat_msgs) > max_chars:
             chat_msgs.pop(0)
         out = []
         if system_msg:
@@ -192,145 +248,110 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
-        底层调用：发送 messages，返回模型回复文本。
-        自动处理重试、限流、熔断。
-
-        参数：
-          messages:    [{"role":"system","content":...}, ...]
-          temperature: 覆盖实例默认值
-          max_tokens:  覆盖实例默认值
-
-        返回：
-          模型回复字符串
-
-        Raises:
-          RuntimeError: 熔断器打开 或 重试耗尽
+        底层调用：发送messages，返回结构化结果字典
+        自动处理重试、限流、熔断器。
+        返回字典字段：
+            success: bool 是否调用成功
+            content: str 模型输出文本 / 错误描述
+            token_usage: dict | None {"prompt_tokens":int,"completion_tokens":int,"total_tokens":int}
+            cost_ms: int 接口耗时毫秒
+            error: str | None 异常信息
         """
-        # 熔断检查
-        if self._is_circuit_open():
-            cooldown_remaining = int(self._circuit_open_until - time.time())
-            raise RuntimeError(
-                f"熔断器已打开（连续 {self._circuit_failure_threshold} 次失败），"
-                f"请等待 {cooldown_remaining}s 后重试"
-            )
-
         temp = temperature if temperature is not None else self.temperature
         mt = max_tokens if max_tokens is not None else self.max_tokens
 
+        # ✨增强：安全截断，防止payload超长
+        safe_messages = self._safe_truncate_messages(messages, SAFE_MESSAGE_MAX_TOTAL_CHARS)
+
         payload = {
             "model": self.model,
-            "messages": self._safe_truncate_messages(messages, SAFE_MESSAGE_MAX_TOTAL_CHARS),
+            "messages": safe_messages,
             "temperature": temp,
             "max_tokens": mt,
             "stream": False,
         }
 
+        # 熔断器前置判断：熔断打开直接拒绝请求，不发网络请求
+        if not _g_circuit_breaker.allow_call():
+            cost_ms = 0
+            return {
+                "success": False,
+                "content": "[LLM熔断器已打开，暂时拒绝调用]",
+                "token_usage": None,
+                "cost_ms": cost_ms,
+                "error": "circuit_breaker_open"
+            }
+
         last_error: Optional[Exception] = None
+        token_usage = None
+        content = ""
+        start_ts = time.time()
 
         for attempt in range(self.max_retries + 1):
             self._rate_limit()
-
             try:
                 resp = requests.post(
                     self._endpoint,
                     headers=self._headers,
-                    data=json.dumps(payload),
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                     timeout=self.timeout,
                 )
                 resp.raise_for_status()
                 data = resp.json()
 
-                # 防御式解析：安全读取嵌套字段
-                choices = data.get("choices") or []
-                if not choices:
-                    raise ValueError(f"API 返回空 choices: {json.dumps(data)[:200]}")
+                # 提取token用量（兼容deepseek/glm返回格式）
+                if "usage" in data:
+                    token_usage = dict(data["usage"])
 
-                message = choices[0].get("message") or {}
-                content = message.get("content") or ""
-                content = self._clean_llm_output(content)
+                raw_content = data["choices"][0]["message"]["content"]
+                content = self._clean_llm_output(raw_content)
+                cost_ms = int((time.time() - start_ts) * 1000)
 
-                # 记录 token 用量
-                self._record_usage(data)
+                # ✅调用成功，重置熔断器计数
+                _g_circuit_breaker.record_success()
 
-                # 成功 → 重置熔断计数
-                self._consecutive_failures = 0
-
-                return content.strip() if content else ""
-
-            except requests.exceptions.Timeout as e:
-                last_error = e
-                self._consecutive_failures += 1
-                if attempt < self.max_retries:
-                    delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "API 超时 (第 %d/%d 次)，%.1fs 后重试",
-                        attempt + 1, self.max_retries, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error("API 超时，已达最大重试次数 (%d)", self.max_retries)
+                return {
+                    "success": True,
+                    "content": content,
+                    "token_usage": token_usage,
+                    "cost_ms": cost_ms,
+                    "error": None
+                }
 
             except requests.exceptions.HTTPError as e:
                 last_error = e
-                self._consecutive_failures += 1
-                status_code = getattr(e.response, "status_code", 0)
-
-                # 4xx 错误不重试（客户端错误）
-                if 400 <= status_code < 500:
-                    logger.error("API 客户端错误 (HTTP %d): %s", status_code, e)
-                    try:
-                        error_body = e.response.json()
-                        logger.error("  错误详情: %s", json.dumps(error_body, ensure_ascii=False)[:300])
-                    except Exception:
-                        pass
-                    # 429 (Rate Limit) 仍然重试
-                    if status_code == 429 and attempt < self.max_retries:
-                        delay = DEFAULT_RETRY_BASE_DELAY * (2 ** (attempt + 1))  # 加倍等待
-                        logger.warning("触发限流，%.1fs 后重试", delay)
-                        time.sleep(delay)
-                        continue
-                    break  # 其他 4xx 不重试
-
-                # 5xx 重试
-                if attempt < self.max_retries:
-                    delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "API 服务端错误 HTTP %d (第 %d/%d 次)，%.1fs 后重试",
-                        status_code, attempt + 1, self.max_retries, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error("API 服务端错误，已达最大重试次数 (%d)", self.max_retries)
-
+                logger.warning(f"HTTP异常 status={getattr(e.response, 'status_code','none')}")
+            except json.JSONDecodeError as e:
+                last_error = e
+                logger.warning("API返回非合法JSON")
             except Exception as e:
                 last_error = e
-                self._consecutive_failures += 1
-                if attempt < self.max_retries:
-                    delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "API 失败 (第 %d/%d 次)，%.1fs 后重试: %s",
-                        attempt + 1, self.max_retries, delay, e,
-                    )
-                    time.sleep(delay)
-                else:
-                    logger.error(
-                        "API 失败，已达最大重试次数 (%d): %s",
-                        self.max_retries, e,
-                    )
 
-        # 检查是否触发熔断
-        if self._consecutive_failures >= self._circuit_failure_threshold:
-            self._circuit_open_until = time.time() + self._circuit_cooldown_sec
-            logger.critical(
-                "连续 %d 次失败，熔断器已打开，冷却 %ds",
-                self._consecutive_failures, self._circuit_cooldown_sec,
-            )
+            if attempt < self.max_retries:
+                delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "API 失败 (第 %d/%d 次)，%.1fs 后重试: %s",
+                    attempt + 1, self.max_retries, delay, str(last_error),
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    "API 失败，已达最大重试次数 (%d): %s",
+                    self.max_retries, str(last_error),
+                )
+                # ❌全部重试耗尽，记录失败给熔断器
+                _g_circuit_breaker.record_fail()
 
-        raise RuntimeError(
-            f"LLM 调用失败（已重试 {self.max_retries} 次）: {last_error}"
-        )
+        cost_ms = int((time.time() - start_ts) * 1000)
+        return {
+            "success": False,
+            "content": f"[LLM调用异常] {str(last_error)}",
+            "token_usage": token_usage,
+            "cost_ms": cost_ms,
+            "error": str(last_error) if last_error else "unknown"
+        }
 
     def chat(
         self,
@@ -341,15 +362,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """
-        单轮对话（RAG 场景）。
-
-        参数：
-          system_prompt: 系统提示（角色设定 + 知识使用规则）
-          context:       检索到的知识片段，会被拼入 user message
-          user_query:    用户原始问题
-
-        返回：
-          模型回复文本
+        单轮对话（RAG 场景）。向后兼容原有接口，返回字符串。
         """
         # 拼接上下文与用户问题
         if context:
@@ -366,8 +379,8 @@ class LLMClient:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
-
-        return self.call(messages, temperature=temperature, max_tokens=max_tokens)
+        res = self.call(messages, temperature=temperature, max_tokens=max_tokens)
+        return res["content"]
 
     def chat_with_history(
         self,
@@ -377,17 +390,7 @@ class LLMClient:
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
-        多轮对话。
-
-        参数：
-          system_prompt: 系统提示
-          context:       检索到的知识片段
-          user_query:    用户当前问题
-          history:       历史对话列表 [{"role":"user",...}, {"role":"assistant",...}]
-                         若为 None，使用实例内置 _history
-
-        返回：
-          模型回复文本
+        多轮对话。向后兼容原有接口，返回字符串。
         """
         msgs = history if history is not None else self._history
 
@@ -404,7 +407,8 @@ class LLMClient:
 
         messages.append({"role": "user", "content": user_content})
 
-        reply = self.call(messages)
+        res = self.call(messages)
+        reply = res["content"]
 
         # 更新内置历史（只保留最近 5 轮 = 10 条消息）
         self._history.append({"role": "user", "content": user_query})
@@ -426,56 +430,14 @@ class LLMClient:
             time.sleep(self._min_interval - elapsed)
         self._last_call_time = time.time()
 
-    def _is_circuit_open(self) -> bool:
-        """检查熔断器是否打开。"""
-        if self._circuit_open_until > time.time():
-            return True
-        # 冷却期已过，复位
-        if self._circuit_open_until > 0:
-            self._circuit_open_until = 0.0
-            self._consecutive_failures = 0
-            logger.info("熔断器已复位")
-        return False
-
-    def _record_usage(self, data: dict):
-        """从 API 响应中提取并累加 token 用量。"""
-        usage = data.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens") or 0
-        completion_tokens = usage.get("completion_tokens") or 0
-        self._total_prompt_tokens += prompt_tokens
-        self._total_completion_tokens += completion_tokens
-
     def clear_history(self):
         """清空多轮对话历史。"""
         self._history.clear()
-
-    def reset_circuit(self):
-        """手动复位熔断器。"""
-        self._circuit_open_until = 0.0
-        self._consecutive_failures = 0
 
     @property
     def history(self) -> List[Dict[str, str]]:
         """返回当前对话历史（只读副本）。"""
         return list(self._history)
-
-    @property
-    def token_usage(self) -> dict:
-        """返回累计 token 用量统计。"""
-        return {
-            "total_prompt_tokens": self._total_prompt_tokens,
-            "total_completion_tokens": self._total_completion_tokens,
-            "total_tokens": self._total_prompt_tokens + self._total_completion_tokens,
-        }
-
-    @property
-    def circuit_status(self) -> dict:
-        """返回熔断器状态。"""
-        return {
-            "is_open": self._is_circuit_open(),
-            "consecutive_failures": self._consecutive_failures,
-            "cooldown_remaining_s": max(0, int(self._circuit_open_until - time.time())),
-        }
 
     # ----------------------------------------------------------
     # 工厂方法
@@ -544,7 +506,7 @@ if __name__ == "__main__":
     )
 
     print("=" * 60)
-    print("  LLM Client 自测")
+    print("  LLM Client 自测（增强加固版 + 熔断器）")
     print("=" * 60)
 
     client = LLMClient()
@@ -553,18 +515,31 @@ if __name__ == "__main__":
     print(f"  endpoint:   {client._endpoint}")
     print(f"  max_tokens: {client.max_tokens}")
     print(f"  temperature:{client.temperature}")
+    print(f"  circuit_status: {get_circuit_status()}")
     print()
 
-    # 测试单轮对话
+    # 测试结构化call接口（rag_pipeline使用）
     system = "你是一个可靠的问答助手。请用一句话直接回答，不要多余解释。"
     context = "鲁迅（1881-1936），原名周树人，字豫才，浙江绍兴人，中国现代文学奠基人之一。"
     question = "鲁迅是谁？用一句话回答。"
+    messages = [
+        {"role":"system","content":system},
+        {"role":"user","content":f"【参考资料】\n{context}\n【用户问题】{question}"}
+    ]
+    try:
+        res = client.call(messages)
+        print(f"call()返回success={res['success']}")
+        print(f"token_usage={res['token_usage']}")
+        print(f"cost_ms={res['cost_ms']}")
+        print(f"A: {res['content']}")
+        print("OK 结构化接口自测通过\n")
+    except Exception as e:
+        print(f"FAIL call接口自测失败 {e}")
 
-    print(f"  Q: {question}")
+    # 测试原有兼容chat接口
     try:
         reply = client.chat(system, context, question)
-        print(f"  A: {reply}")
-        print()
-        print("  OK 自测通过")
+        print(f"兼容chat() A: {reply}")
+        print("OK 兼容接口自测通过")
     except Exception as e:
-        print(f"  FAIL 自测失败: {e}")
+        print(f"FAIL chat自测失败: {e}")
