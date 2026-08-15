@@ -98,6 +98,22 @@ LUXUN_STYLE_PATTERNS = [
     re.compile(r'(?:这|那).*(?:缘故|道理|意思|说法).*'),
 ]
 
+# 拒绝语境标记 — 拒绝式回答中为解释拒绝而提及的实体，不属于事实断言
+# （与 consistency_checker 的"拒绝语境豁免"保持一致，避免正确拒绝被误判为无支撑幻觉）
+_REFUSAL_HINTS = [
+    "不知道", "不晓得", "不知晓", "不懂", "不了解", "不清楚", "不熟悉",
+    "未曾听说", "未曾见过", "未曾听闻", "不认识", "没听说",
+    "不能回答", "无法回答", "无从回答", "难以回答", "无从",
+    "不是我所能", "非我所知", "属于另一个时代", "身后", "生前", "死后",
+    "你问的", "你说的", "你所问", "提到的", "所谓", "问的是",
+]
+
+
+def _in_refusal_context(text: str, idx: int, window: int = 40) -> bool:
+    """判断某位置 idx 前后 window 字符内是否处于拒绝/转述语境。"""
+    seg = text[max(0, idx - window): min(len(text), idx + window)]
+    return any(m in seg for m in _REFUSAL_HINTS)
+
 # ============================================================
 # 数据结构
 # ============================================================
@@ -296,6 +312,9 @@ class HallucinationChecker:
                 if w in ("鲁迅", "周树人", "我"):
                     continue
                 idx = text.find(w)
+                # 拒绝语境豁免：拒绝/坦承不知时提及的人名，不是事实断言
+                if _in_refusal_context(text, idx):
+                    continue
                 context_start = max(0, idx - 20)
                 context_end = min(len(text), idx + 25)
                 snippet = text[context_start:context_end].strip()
@@ -316,6 +335,9 @@ class HallucinationChecker:
                 if w in ("广州", "中国"):
                     continue
                 idx = text.find(w)
+                # 拒绝语境豁免：拒绝时提及的地名，不是事实断言
+                if _in_refusal_context(text, idx):
+                    continue
                 context_start = max(0, idx - 20)
                 context_end = min(len(text), idx + 25)
                 snippet = text[context_start:context_end].strip()

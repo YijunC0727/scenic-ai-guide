@@ -116,6 +116,53 @@ PRE_1936_SAFE = [
     "五四", "五四运动", "新文化运动",
 ]
 
+# ============================================================
+# 拒绝语境豁免 (Refusal Context Exemption)
+# ============================================================
+# 当回答是"拒绝式回答"（坦承不知 / 越界拒答）时，为解释拒绝而
+# 必然提及的现代词/人物/年份，不应计为时间违规。否则"正确拒绝"
+# 会被误判为"时间穿越"，产生假 FAIL（阶段三已预警的误判风险）。
+
+# 回答级拒绝标记：出现任一即判定整段为拒绝式回答
+REFUSAL_MARKERS = [
+    "不知道", "不晓得", "不知晓", "不懂", "不了解", "不清楚", "不熟悉",
+    "未曾听说", "未曾见过", "未曾听闻", "未曾经历", "不认识", "没听说",
+    "不能回答", "无法回答", "无从回答", "难以回答", "无可奉告", "无从谈起",
+    "恐怕难以", "不便回答", "不便妄加", "不能妄加", "不敢妄议", "不便置评",
+    "不是我所能", "非我所知", "说不上来", "想不起来",
+    "属于另一个时代", "另一个时代", "身后", "生前", "死后", "超出我",
+    "在我的记忆之外", "记忆之外",
+    "资料有限", "资料缺乏", "所据有限", "我手头",
+]
+
+# 转述用户提问的表述（回答在引用用户原话，而非自己断言）
+QUOTE_FRAMING_MARKERS = [
+    "你问的", "你问起", "你说的", "你所问", "你所提", "你所言",
+    "提到的", "所提到的", "所谓", "问题是", "问及", "问的是",
+]
+
+
+def _is_refusal(text: str) -> bool:
+    """判断整段回答是否为拒绝式回答（坦承不知 / 越界拒答）。"""
+    return any(m in text for m in REFUSAL_MARKERS)
+
+
+def _quote_framed(text: str, idx: int, window: int = 25) -> bool:
+    """关键词 idx 之前是否在转述用户提问（你问的 / 你说的 …）。"""
+    pre = text[max(0, idx - window): idx]
+    return any(m in pre for m in QUOTE_FRAMING_MARKERS)
+
+
+def _near_refusal(text: str, idx: int, window: int = 50) -> bool:
+    """关键词 idx 前后 window 字符内是否出现拒绝标记。"""
+    seg = text[max(0, idx - window): min(len(text), idx + window)]
+    return any(m in seg for m in REFUSAL_MARKERS)
+
+
+def _exempt_mention(text: str, idx: int) -> bool:
+    """拒绝语境豁免：转述用户提问，或作为拒绝解释的一部分被提及。"""
+    return _quote_framed(text, idx) or _near_refusal(text, idx)
+
 
 def _check_time_boundary(text: str, intent: str) -> List[dict]:
     """
@@ -126,14 +173,14 @@ def _check_time_boundary(text: str, intent: str) -> List[dict]:
     """
     violations = []
 
-    # 讲解模式宽松处理（因为可能涉及现代纪念馆运营）
-    severity_modifier = 0.5 if intent == "narrator" else 1.0
-
     # 1. 检查1936年后具体年份
     years = RE_POST_1936_YEAR.findall(text)
     for yr in years:
         yr_int = int(yr)
         if yr_int > 1936:
+            idx = text.find(f"{yr}年")
+            if _exempt_mention(text, idx):
+                continue  # 拒绝语境豁免：转述用户提问/解释拒绝时提及的年份
             violations.append({
                 "layer": "time",
                 "rule": "post_1936_year",
@@ -145,19 +192,9 @@ def _check_time_boundary(text: str, intent: str) -> List[dict]:
     # 2. 检查1936年后关键词
     for kw in POST_1936_KEYWORDS:
         if kw in text:
-            # 排除引用/解释语境（如"你问的互联网是..."）
             idx = text.find(kw)
-            context_start = max(0, idx - 30)
-            context_pre = text[context_start:idx]
-
-            # 如果是在引用用户问题或做边界声明，跳过
-            if any(disc in context_pre for disc in [
-                "你问的", "你说的", "提到的", "所谓", "问题是",
-                "我不知道", "我不懂", "不是我所能知道", "未曾见过",
-                "我死后", "那是属于另一个时代",
-            ]):
-                continue
-
+            if _exempt_mention(text, idx):
+                continue  # 拒绝语境豁免：转述用户提问/解释拒绝时提及现代词
             violations.append({
                 "layer": "time",
                 "rule": "post_1936_keyword",
@@ -169,14 +206,9 @@ def _check_time_boundary(text: str, intent: str) -> List[dict]:
     # 3. 检查当代人物
     for person in POST_1936_PERSONS:
         if person in text:
-            # 排除"我不知道XXX是谁"这类声明
             idx = text.find(person)
-            context_start = max(0, idx - 20)
-            context_pre = text[context_start:idx]
-            if any(disc in context_pre for disc in [
-                "我不知道", "不认识", "未曾听说", "不知道谁是",
-            ]):
-                continue
+            if _exempt_mention(text, idx):
+                continue  # 拒绝语境豁免：拒绝/坦承不知时提及的当代人物
             violations.append({
                 "layer": "time",
                 "rule": "post_1936_person",
@@ -188,6 +220,9 @@ def _check_time_boundary(text: str, intent: str) -> List[dict]:
     # 4. 检查当代政治人物
     for person in CONTEMPORARY_POLITICAL:
         if person in text:
+            idx = text.find(person)
+            if _exempt_mention(text, idx):
+                continue  # 拒绝语境豁免：拒绝评价当代政治人物是正确行为
             violations.append({
                 "layer": "time",
                 "rule": "contemporary_political",
@@ -539,8 +574,10 @@ class ConsistencyChecker:
         high_voice = sum(1 for v in voice_violations if v["severity"] == "high")
         med_voice = sum(1 for v in voice_violations if v["severity"] == "medium")
 
-        score -= high_time * self.weight_time * 1.5
-        score -= med_time * self.weight_time * 1.0
+        # 阈值微调：讲解模式宽松处理（可能涉及现代纪念馆运营），时间违规扣分减半
+        time_scale = 0.5 if intent == "narrator" else 1.0
+        score -= high_time * self.weight_time * 1.5 * time_scale
+        score -= med_time * self.weight_time * 1.0 * time_scale
         score -= high_voice * self.weight_voice * 1.5
         score -= med_voice * self.weight_voice * 1.0
         score = max(0.0, min(1.0, score))
