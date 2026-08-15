@@ -61,7 +61,7 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 
 from intent_classifier import classify
-from llm_client import LLMClient
+from llm_client import LLMClient, get_circuit_status
 from query_rewriter import QueryRewriter, RewriteResult
 from quality_guard import QualityGuard, GuardResult, get_fallback
 
@@ -352,6 +352,9 @@ class ConversationState:
     turn_count: int = 0
 
     def add(self, user: str, assistant: str):
+        # 强类型转换：禁止 dict/对象 存入 content，避免 LLM API 400
+        user = str(user)
+        assistant = str(assistant)
         self.history.append({"role": "user", "content": user})
         self.history.append({"role": "assistant", "content": assistant})
         self.turn_count += 1
@@ -363,8 +366,11 @@ class ConversationState:
 
     def get_recent_qa(self) -> Optional[str]:
         if len(self.history) >= 2:
-            last_user = self.history[-2]["content"]
-            last_assistant = self.history[-1]["content"]
+            # 安全防御：用 .get 规避 KeyError，强转 str 规避 None/切片报错
+            last_user = self.history[-2].get("content", "")
+            last_assistant = self.history[-1].get("content", "")
+            last_user = str(last_user) if last_user is not None else ""
+            last_assistant = str(last_assistant) if last_assistant is not None else ""
             return f"上文: 问「{last_user[:80]}」答「{last_assistant[:60]}」"
         return None
 
@@ -776,6 +782,9 @@ class RAGPipeline:
 
         # ── Step 4: 保存对话历史 ──
         self.state.add(user_input, reply)
+
+        # 追加熔断器状态，供前端调试面板读取
+        self.last_debug["circuit_status"] = get_circuit_status()
 
         self.last_debug["elapsed_ms"] = int((time.time() - t_start) * 1000)
         self.last_debug["reply_len"] = len(reply)
