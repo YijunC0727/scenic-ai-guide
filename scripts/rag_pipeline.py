@@ -252,6 +252,7 @@ class Retriever:
         用于首次检索结果太少或太单一的情况。
         """
         import jieba
+        import jieba.posseg  # 显式加载词性标注子模块
         # 提取长度≥2的名词/动词作为关键词
         keywords = []
         for w, flag in jieba.posseg.cut(query):

@@ -30,6 +30,7 @@ from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass, field
 
 import jieba
+import jieba.posseg  # noqa: F401 — 显式加载词性标注子模块，否则 jieba.posseg 不可用
 
 logger = logging.getLogger("hallucination_checker")
 

@@ -37,7 +37,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPT_DIR)
 
-from rag_pipeline import RAGPipeline
+from rag_pipeline import RAGPipeline, ConversationState
 from hallucination_checker import HallucinationChecker
 from consistency_checker import ConsistencyChecker
 
@@ -188,6 +188,8 @@ class EvalRunner:
 
         # Step 1: 通过 RAG 管线生成回答
         try:
+            # 每题独立评估：重置对话状态，避免前序题目历史串入本题
+            self.pipeline.state = ConversationState()
             t_start = time.time()
             # return_retrieval=True 获取检索片段，供幻觉检测使用
             reply, chunks = self.pipeline.ask(

@@ -103,6 +103,16 @@ MODERN_TECH = [
     "奥斯卡", "奥运会", "世界杯", "联合国",
 ]
 
+# 当代人物（1949年前后出生/成名，鲁迅在1936年殁后不可能知晓）
+MODERN_FIGURES = [
+    # 当代华语/世界文学人物（常被拿来与鲁迅比较）
+    "村上春树", "莫言", "余华", "贾平凹", "金庸", "古龙", "三毛",
+    "王朔", "刘慈欣", "韩寒", "郭敬明", "王小波", "史铁生",
+    "海子", "顾城", "北岛", "迟子建", "苏童", "阿来",
+    # 当代科技/商业名人
+    "马云", "马化腾", "李彦宏", "任正非", "雷军", "乔布斯", "马斯克",
+]
+
 FUTURE_TIME_MARKERS = [
     "新中国成立", "解放后", "建国后", "改革开放",
     "文革", "文化大革命", "大跃进",
@@ -242,14 +252,21 @@ def check_time_clash(text: str) -> Optional[dict]:
     tech = _match_keywords(text, MODERN_TECH)
     matched.extend(tech)
 
+    # 当代人物词
+    figures = _match_keywords(text, MODERN_FIGURES)
+    matched.extend(figures)
+
     # 跨越句式
     clash_patterns = _match_any(text, TIME_CLASH_PATTERNS)
     matched.extend(clash_patterns)
 
     if matched:
-        # 置信度：现代科技词+句式 > 纯句式 > 纯单个科技词
+        # 置信度：现代科技词+句式 > 当代人物/纯句式 > 纯单个科技词
         if tech and clash_patterns:
             confidence = 0.92
+        elif figures:
+            # 当代人物名无歧义，是强时间越界信号
+            confidence = 0.88
         elif clash_patterns:
             confidence = 0.88
         elif len(tech) >= 2:

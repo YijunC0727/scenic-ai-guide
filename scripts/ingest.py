@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 # ==================== 全局配置 ====================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+ROOT = os.path.dirname(SCRIPT_DIR)  # 仓库根目录 = scripts 的上一级
 
 LOCAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "bge-small-zh-v1.5")
 HF_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
