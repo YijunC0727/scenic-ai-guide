@@ -99,7 +99,7 @@ class CircuitBreaker:
         return False
 
 # 全局单例熔断器实例
-_g_circuit_breaker = CircuitBreaker(fail_threshold=3, reset_timeout=10)
+_g_circuit_breaker = CircuitBreaker(fail_threshold=5, reset_timeout=60)
 
 
 def get_circuit_status() -> Dict[str, Any]:
@@ -123,7 +123,7 @@ DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0     # 秒，指数退避基数
 DEFAULT_MIN_INTERVAL = 0.3          # 秒，两次调用最小间隔（简单限流）
-DEFAULT_TIMEOUT = 60                # 秒
+DEFAULT_TIMEOUT = 30                # 秒
 SAFE_MESSAGE_MAX_TOTAL_CHARS = 12000  # messages总字符安全上限，防止超长报错
 
 # 常用 provider → base_url 映射
@@ -180,6 +180,10 @@ class LLMClient:
 
         # 对话历史（多轮对话管理）
         self._history: List[Dict[str, str]] = []
+
+        # Token 用量统计（累计）
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
 
         # --- 校验 ---
         if not self.api_key:
@@ -304,6 +308,8 @@ class LLMClient:
                 # 提取token用量（兼容deepseek/glm返回格式）
                 if "usage" in data:
                     token_usage = dict(data["usage"])
+                    self._total_prompt_tokens += token_usage.get("prompt_tokens") or 0
+                    self._total_completion_tokens += token_usage.get("completion_tokens") or 0
 
                 raw_content = data["choices"][0]["message"]["content"]
                 content = self._clean_llm_output(raw_content)
@@ -438,6 +444,24 @@ class LLMClient:
     def history(self) -> List[Dict[str, str]]:
         """返回当前对话历史（只读副本）。"""
         return list(self._history)
+
+    def reset_circuit(self):
+        """手动复位全局熔断器。"""
+        _g_circuit_breaker.record_success()
+
+    @property
+    def token_usage(self) -> dict:
+        """返回累计 token 用量统计。"""
+        return {
+            "total_prompt_tokens": self._total_prompt_tokens,
+            "total_completion_tokens": self._total_completion_tokens,
+            "total_tokens": self._total_prompt_tokens + self._total_completion_tokens,
+        }
+
+    @property
+    def circuit_status(self) -> dict:
+        """返回熔断器状态（映射到全局熔断器）。"""
+        return get_circuit_status()
 
     # ----------------------------------------------------------
     # 工厂方法

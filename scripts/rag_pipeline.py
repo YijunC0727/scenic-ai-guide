@@ -698,7 +698,11 @@ class RAGPipeline:
                     f"【用户问题】\n{user_input}"
                 ) if context_str else user_input
                 messages.append({"role": "user", "content": user_content})
-                return self.llm.call(messages, temperature=temp)
+                res = self.llm.call(messages, temperature=temp)
+                # call() 返回结构化 dict；失败时抛出，交由上层兜底逻辑处理
+                if not res.get("success"):
+                    raise RuntimeError(res.get("error") or "LLM 调用失败")
+                return res.get("content", "")
             else:
                 return self.llm.chat(
                     system_prompt=system_prompt,
