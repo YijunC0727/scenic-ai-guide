@@ -124,6 +124,7 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0     # 秒，指数退避基数
 DEFAULT_MIN_INTERVAL = 0.3          # 秒，两次调用最小间隔（简单限流）
 DEFAULT_TIMEOUT = 30                # 秒
+DEFAULT_THINKING = "disabled"       # DeepSeek V4 思考模式：disabled=快速直答(等价旧deepseek-chat)
 SAFE_MESSAGE_MAX_TOTAL_CHARS = 12000  # messages总字符安全上限，防止超长报错
 
 # 常用 provider → base_url 映射
@@ -173,6 +174,9 @@ class LLMClient:
 
         self.max_retries = max_retries
         self.timeout = timeout
+
+        # 思考模式（DeepSeek V4）：disabled=快速直答，enabled=深度思考，空字符串=不发送该字段
+        self.thinking = os.getenv("LLM_THINKING", DEFAULT_THINKING)
 
         # 简单限流
         self._last_call_time = 0.0
@@ -277,6 +281,10 @@ class LLMClient:
             "stream": False,
         }
 
+        # DeepSeek V4 思考模式控制（disabled → 快速直答，避免思考吃满 max_tokens）
+        if self.thinking:
+            payload["thinking"] = {"type": self.thinking}
+
         # 熔断器前置判断：熔断打开直接拒绝请求，不发网络请求
         if not _g_circuit_breaker.allow_call():
             cost_ms = 0
@@ -314,6 +322,13 @@ class LLMClient:
                 raw_content = data["choices"][0]["message"]["content"]
                 content = self._clean_llm_output(raw_content)
                 cost_ms = int((time.time() - start_ts) * 1000)
+
+                # 防御：思考模式吃满 max_tokens → 回答截断/空内容，按失败处理触发重试
+                finish_reason = data["choices"][0].get("finish_reason", "")
+                if finish_reason == "length":
+                    raise RuntimeError(f"回答被截断 (finish_reason=length, max_tokens={mt})")
+                if not content:
+                    raise RuntimeError("模型返回空内容")
 
                 # ✅调用成功，重置熔断器计数
                 _g_circuit_breaker.record_success()

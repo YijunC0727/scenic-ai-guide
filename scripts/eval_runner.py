@@ -250,11 +250,18 @@ class EvalRunner:
             result.consistency_score = 1.0
 
         # Step 4: 综合评分
-        result.auto_score = compute_auto_score(
-            result.hallucination_score,
-            result.consistency_score,
-        )
-        result.auto_grade = compute_grade(result.auto_score)
+        if not (reply or "").strip():
+            # 空回答：检查器对空输入会空转返回满分，这里强制判 FAIL，避免掩盖生成失败
+            result.auto_score = 0.0
+            result.auto_grade = "FAIL"
+            result.hallucination_summary = "空回答"
+            result.consistency_summary = "空回答"
+        else:
+            result.auto_score = compute_auto_score(
+                result.hallucination_score,
+                result.consistency_score,
+            )
+            result.auto_grade = compute_grade(result.auto_score)
 
         if self.verbose:
             print(f"  综合: {result.auto_score} [{result.auto_grade}] "
