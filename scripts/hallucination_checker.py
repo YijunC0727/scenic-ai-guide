@@ -30,6 +30,7 @@ from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass, field
 
 import jieba
+import jieba.posseg
 
 logger = logging.getLogger("hallucination_checker")
 
