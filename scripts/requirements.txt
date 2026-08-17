@@ -1,0 +1,15 @@
+chromadb           : 1.5.9
+transformers       : 5.5.0
+torch              : 2.4.1+cpu
+jieba              : 0.42.1
+requests           : 2.34.2
+numpy              : 1.26.4
+huggingface_hub： 1.19.0
+python‑dotenv    ： 0.21.0
+tqdm version: 4.66.5
+sentence‑transformers : 5.5.1
+fastapi        : 0.141.1
+uvicorn        : 0.51.0
+scikit-learn : 1.9.0
+openai          : 2.8.1
+gradio          : 6.22.0
