@@ -1,5 +1,8 @@
 # 在线体验 Demo 部署指南 —— HuggingFace Spaces
 
+> ⚠️ **2026 年 7 月起，HuggingFace 免费 `cpu-basic` 上的 Gradio / Docker Space 改收 PRO（$9/月）。**
+> 免费部署请改用 [docs/render-deploy.md](render-deploy.md)（Render 免费档）。本页保留给日后愿意付费 PRO、或需要 HF 生态的场景。
+
 把 `space/` 目录部署成一个可公网访问的在线 Demo。游客打开网页即可体验「鲁迅数字人 · 双模式对话」。
 
 ## 0. 这个 Demo 怎么跑起来的

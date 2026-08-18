@@ -39,9 +39,10 @@ os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-# 国内环境走 hf-mirror 镜像加速；HuggingFace Spaces（有 SPACE_ID）改用官方源，
-# 否则第三方镜像可能限流/不可达，导致 BGE 模型在 Space 上无法下载。
-if not os.environ.get("SPACE_ID"):
+# 国内本地环境走 hf-mirror 镜像加速；云端部署改用官方源
+# （HuggingFace Spaces 有 SPACE_ID，Render 有 RENDER），否则第三方镜像可能
+# 限流/不可达，导致 BGE 模型在云端无法下载。
+if not os.environ.get("SPACE_ID") and not os.environ.get("RENDER"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 import sys

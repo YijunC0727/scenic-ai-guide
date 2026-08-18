@@ -1,0 +1,21 @@
+# Render Blueprint —— 在线体验 Demo（鲁迅数字人 · 双模式对话）
+# 用法：把本仓库 push 到 GitHub 后，Render 控制台 → New → Blueprint → 选此仓库即可。
+# 详细步骤见 docs/render-deploy.md
+
+services:
+  - type: web
+    name: luxun-digital-human
+    runtime: python
+    rootDir: space
+    plan: starter                     # 免费档（starter = free）
+    buildCommand: pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com
+      - key: LLM_MODEL
+        value: deepseek-v4-flash
+      - key: LLM_THINKING
+        value: disabled
+      # LLM_API_KEY 是密钥，不要写进 render.yaml；部署后在 Render 后台手动添加
+      # （Dashboard → 该服务 → Environment → Add Variable → LLM_API_KEY，勾选 secret）

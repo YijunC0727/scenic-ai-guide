@@ -103,13 +103,15 @@ curl http://localhost:8000/health
 
 机器人对接契约详见 [docs/deployment-guide.md](docs/deployment-guide.md)。服务启动后访问 `http://localhost:8000/docs` 有交互式接口文档。
 
-## 在线体验 Demo（HuggingFace Spaces）
+## 在线体验 Demo（Render 免费托管）
 
-`space/` 目录是一个可独立部署到 HuggingFace Spaces 的在线体验 Demo（Gradio 界面，讲解员 / 鲁迅双模式 + 调试面板）。部署步骤见 [docs/hf-spaces-deploy.md](docs/hf-spaces-deploy.md)。
+`space/` 目录是一个可独立部署的在线体验 Demo（Gradio 界面，讲解员 / 鲁迅双模式 + 调试面板）。部署到 Render 免费档，步骤见 [docs/render-deploy.md](docs/render-deploy.md)。
 
-- BGE 模型由 Space 冷启动时从 HF 官方源自动下载，**不提交**；
+- BGE 模型由冷启动时从 HF 官方源自动下载，**不提交**；
 - `space/chroma_db/` 向量库已随仓库提交（约 3MB）；
-- DeepSeek API Key 通过 Space 的 Secret（`LLM_API_KEY`）注入，**不写入代码**。
+- DeepSeek API Key 通过 Render 环境变量（`LLM_API_KEY`）注入，**不写入代码**。
+
+> 注：HuggingFace 免费 Gradio Space 已于 2026 年 7 月起收 PRO（$9/月），故改用 Render；若日后付费，`space/` 同样可直接上 HF Spaces（见 [docs/hf-spaces-deploy.md](docs/hf-spaces-deploy.md)）。
 
 ## 团队
 
