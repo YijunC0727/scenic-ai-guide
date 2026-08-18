@@ -50,3 +50,7 @@ scripts/bge-small-zh-v1.5/
 
 # 离线资源包（本地生成，不入库）
 releases/
+
+# 在线 Demo（space/）的向量库需随仓库提交到 HuggingFace Spaces —— 覆盖上面的 chroma_db/*.sqlite3 规则
+!space/chroma_db/
+!space/chroma_db/**

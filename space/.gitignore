@@ -1,0 +1,3 @@
+# Space 目录内的忽略规则 —— 注意：chroma_db/ 必须随 Space 提交，不能忽略
+__pycache__/
+*.py[cod]

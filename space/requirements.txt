@@ -1,0 +1,15 @@
+# Online demo dependencies (HuggingFace Spaces, Python 3.12)
+# Same pinned versions as the program package, plus gradio for the web UI.
+# (No fastapi/uvicorn/pydantic here — those are for the robot API, not the Space.)
+
+chromadb==1.5.9
+transformers==5.8.1
+torch==2.12.0
+sentence-transformers==5.5.0
+jieba==0.42.1
+requests==2.32.3
+python-dotenv==1.2.2
+tqdm==4.67.3
+numpy==2.2.0
+huggingface_hub==1.15.0
+gradio==6.22.0
