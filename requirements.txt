@@ -1,4 +1,20 @@
-# 核心依赖（启动会后补充完整）
-chromadb
-openai
-python-dotenv
+# Core dependencies (pinned to verified environment, Python 3.12.1)
+chromadb==1.5.9
+transformers==5.8.1
+torch==2.12.0
+sentence-transformers==5.5.0
+jieba==0.42.1
+requests==2.32.3
+python-dotenv==1.2.2
+tqdm==4.67.3
+numpy==2.2.0
+huggingface_hub==1.15.0
+
+# Phase 4 additions: FastAPI service
+fastapi==0.141.1
+uvicorn==0.47.0
+pydantic==2.13.4
+
+# Optional (legacy Gradio UI / data-gen tool only)
+# gradio==6.22.0
+# openai==2.8.1
