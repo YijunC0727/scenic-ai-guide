@@ -17,6 +17,9 @@ env/
 # 环境变量（包含API Key）
 .env
 
+# Gradio 本地缓存（自签证书等，运行时生成）
+.gradio/
+
 # IDE
 .vscode/
 .idea/

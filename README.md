@@ -103,15 +103,21 @@ curl http://localhost:8000/health
 
 机器人对接契约详见 [docs/deployment-guide.md](docs/deployment-guide.md)。服务启动后访问 `http://localhost:8000/docs` 有交互式接口文档。
 
-## 在线体验 Demo（Render 免费托管）
+## 在线体验 Demo
 
-`space/` 目录是一个可独立部署的在线体验 Demo（Gradio 界面，讲解员 / 鲁迅双模式 + 调试面板）。部署到 Render 免费档，步骤见 [docs/render-deploy.md](docs/render-deploy.md)。
+`space/` / `scripts/gradio_app.py` 是可独立部署的在线体验 Demo（Gradio 界面，讲解员 / 鲁迅双模式 + 调试面板）。三条部署路线：
 
-- BGE 模型由冷启动时从 HF 官方源自动下载，**不提交**；
-- `space/chroma_db/` 向量库已随仓库提交（约 3MB）；
-- DeepSeek API Key 通过 Render 环境变量（`LLM_API_KEY`）注入，**不写入代码**。
+| 路线 | 公网可达 | 国内访问 | 说明 |
+|------|---------|---------|------|
+| **云服务器（推荐）** | ✅ 稳定 IP | ✅ 快 | 见 [docs/cloud-server-deploy.md](docs/cloud-server-deploy.md)，一键脚本 `scripts/deploy_cloud.sh` |
+| Render 免费档 | ✅ | 🟡 一般 | 见 [docs/render-deploy.md](docs/render-deploy.md)，免费但会休眠、512MB 易 OOM |
+| HuggingFace Spaces | ✅ | 🟡 | 免费 Gradio Space 已收 PRO（$9/月），见 [docs/hf-spaces-deploy.md](docs/hf-spaces-deploy.md) |
 
-> 注：HuggingFace 免费 Gradio Space 已于 2026 年 7 月起收 PRO（$9/月），故改用 Render；若日后付费，`space/` 同样可直接上 HF Spaces（见 [docs/hf-spaces-deploy.md](docs/hf-spaces-deploy.md)）。
+> ⚠️ `gradio --share` 临时链接在墙内**连不上**（frpc 无法直连美国中转服务器），不建议作为交付链接。
+
+三件套资源（BGE 模型 / 向量库 / 知识库）与 DeepSeek API Key 均**不进 git**：
+- 云服务器 / Render 冷启动自动下载 BGE 模型，向量库随 `space/chroma_db/` 提交（约 3MB）；
+- API Key 通过环境变量（`LLM_API_KEY`）注入，**不写入代码**。
 
 ## 团队
 

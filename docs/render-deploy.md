@@ -69,16 +69,11 @@
 | 回答「电线那一头睡过去了」 | DeepSeek 不可达 | 检查 `LLM_BASE_URL` / Key 是否有效 |
 | 想更新 | 改了主仓库 `scripts/` 后 | 重新复制 7 个脚本到 `space/scripts/`，push，Render 自动重建 |
 
-## 6. 回退方案：临时 share 链接（不依赖任何云）
+## 6. 回退方案
 
-若 Render 的 512MB 内存跑 torch 确实 OOM（Build 或运行失败），就用本地临时公网链接应急——足够录演示视频和短期评审：
+若 Render 的 512MB 内存跑 torch 确实 OOM（Build 或运行失败），按优先级：
 
-```bash
-pip install gradio
-cd scenic-ai-guide
-python scripts/gradio_app.py --share
-```
+1. **云服务器**（推荐，最稳）—— 见 [docs/cloud-server-deploy.md](cloud-server-deploy.md)，一键脚本 `scripts/deploy_cloud.sh`，公网 IP 直连、无休眠、内存宽裕。
+2. **国产内网穿透**（cpolar / natapp 免费档）—— 国内秒开，但需本机在线 + 手机号注册。
 
-`--share` 会生成一个 72 小时有效的公网链接（`https://xxx.gradio.live`）。前提：本机已具备三件套（BGE 模型 / chroma_db / data）和 DeepSeek Key 的 `.env`。
-
-> 更稳的免费长期方案是换成 Streamlit Community Cloud（~1GB 内存），但需要把 Gradio 界面重写成 Streamlit；如需要我再做。
+> ⚠️ 不再推荐 `gradio --share`：实测墙内 `frpc` 无法直连 gradio 美国中转服务器（`44.237.78.176:7000` 超时），生成的 `gradio.live` 链接国内也大概率打不开，不能作为交付链接。
